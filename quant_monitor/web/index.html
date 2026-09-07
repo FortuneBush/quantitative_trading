@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#081019">
+  <meta name="description" content="本地银行板块 A 股量化研究监控平台">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230c2430'/%3E%3Cpath d='M7 23l6-7 4 3 8-11' fill='none' stroke='%2320c7b7' stroke-width='2.5'/%3E%3C/svg%3E">
+  <title>QuantScope · 银行板块量化监控</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand" aria-label="QuantScope A股量化监控">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" role="img"><path d="M5 22.5 11 16l5 4 10-11"/><path d="M21 9h5v5"/><path class="brand-axis" d="M5 7v18h22"/></svg>
+        </span>
+        <span><strong>QuantScope</strong><small>银行板块量化监控</small></span>
+      </div>
+
+      <div class="topbar-status" aria-label="连接与市场状态">
+        <div class="market-clock">
+          <span id="market-badge" class="status-pill neutral"><i></i><span>判断中</span></span>
+          <time id="clock" datetime="">--:--:--</time>
+          <small>北京时间</small>
+        </div>
+        <div class="connection-group">
+          <span id="api-status" class="status-pill neutral" title="浏览器到本地 HTTP API 的连接状态"><i></i><span>本地 API 检查中</span></span>
+          <span id="ws-status" class="status-pill neutral" title="浏览器到本地服务的增量推送通道；不代表上游供应商提供 WebSocket"><i></i><span>本地推送连接中</span></span>
+          <span id="provider-status" class="status-pill neutral" title="本地服务访问上游行情 API 的状态"><i></i><span>行情源检查中</span></span>
+        </div>
+        <button id="refresh-all" class="icon-button" type="button" title="刷新全部数据" aria-label="刷新全部数据">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"/><path d="M19 11a7.5 7.5 0 1 0 .1 4"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main id="main-content" class="dashboard" tabindex="-1">
+      <section class="hero-row" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">BANK SECTOR RESEARCH</p>
+          <h1 id="page-title">银行板块量化监控</h1>
+          <p id="last-updated" class="muted">正在连接本地数据服务…</p>
+        </div>
+        <div class="hero-actions">
+          <button id="open-settings" class="secondary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.08A1.7 1.7 0 0 0 8.96 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15 1.7 1.7 0 0 0 3.08 14H3v-4h.08A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3.08V3h4v.08A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9 1.7 1.7 0 0 0 20.92 10H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></svg>
+            数据设置
+          </button>
+        </div>
+      </section>
+
+      <section id="readiness-banner" class="readiness-banner" aria-labelledby="readiness-title" aria-live="polite" hidden>
+        <div class="readiness-copy">
+          <span id="readiness-icon" class="readiness-icon" aria-hidden="true"></span>
+          <div>
+            <div class="readiness-heading">
+              <h2 id="readiness-title">服务已启动，历史数据在后台准备</h2>
+              <span id="readiness-badge" class="status-pill neutral"><i></i><span>等待进度</span></span>
+            </div>
+            <p id="readiness-summary">已准备 0 / 0 只股票</p>
+            <p id="readiness-detail" class="muted">页面可以继续访问；量化排名将在历史日线满足要求后自动出现。</p>
+          </div>
+        </div>
+        <div class="readiness-progress-wrap">
+          <div
+            id="readiness-progress"
+            class="readiness-progress"
+            role="progressbar"
+            aria-label="历史日线准备进度"
+            aria-valuemin="0"
+            aria-valuemax="0"
+            aria-valuenow="0"
+          ><span id="readiness-progress-bar"></span></div>
+          <span id="readiness-percent">0%</span>
+        </div>
+      </section>
+
+      <section id="overview-cards" class="overview-grid" aria-label="银行板块覆盖率、涨跌家数、中位涨幅与额度概览" aria-live="polite">
+        <article class="metric-card skeleton-card"><span class="skeleton short"></span><span class="skeleton value"></span><span class="skeleton medium"></span></article>
+        <article class="metric-card skeleton-card"><span class="skeleton short"></span><span class="skeleton value"></span><span class="skeleton medium"></span></article>
+        <article class="metric-card skeleton-card"><span class="skeleton short"></span><span class="skeleton value"></span><span class="skeleton medium"></span></article>
+        <article class="metric-card skeleton-card"><span class="skeleton short"></span><span class="skeleton value"></span><span class="skeleton medium"></span></article>
+      </section>
+
+      <section class="insights-grid" aria-label="银行板块广度与量化分析">
+        <section class="panel market-insights-panel" aria-labelledby="market-insights-title">
+          <header class="panel-header">
+            <div>
+              <p class="panel-kicker">BANK SECTOR SCOPE</p>
+              <h2 id="market-insights-title">银行板块概览</h2>
+            </div>
+            <div class="insight-meta">
+              <span id="market-source" class="status-pill neutral"><i></i><span>等待快照</span></span>
+              <span id="market-total" class="count-badge">— 只</span>
+              <span id="bank-quota-badge" class="count-badge quota-badge">额度 —</span>
+            </div>
+          </header>
+          <div id="market-breadth" class="breadth-grid" aria-live="polite">
+            <div class="breadth-item"><span>上涨</span><strong>—</strong></div>
+            <div class="breadth-item"><span>下跌</span><strong>—</strong></div>
+            <div class="breadth-item"><span>平盘</span><strong>—</strong></div>
+            <div class="breadth-item"><span>中位涨幅</span><strong>—</strong></div>
+          </div>
+          <div class="bank-rankings-grid">
+            <section class="leader-column" aria-labelledby="gainers-title">
+              <h3 id="gainers-title">银行涨幅榜 <small>按涨跌幅</small></h3>
+              <ol id="market-gainers" class="leader-list"><li class="leader-empty">等待行情快照</li></ol>
+            </section>
+            <section class="leader-column" aria-labelledby="losers-title">
+              <h3 id="losers-title">银行跌幅榜 <small>按涨跌幅</small></h3>
+              <ol id="market-losers" class="leader-list"><li class="leader-empty">等待行情快照</li></ol>
+            </section>
+            <section class="leader-column" aria-labelledby="turnover-title">
+              <h3 id="turnover-title">成交额榜 <small>本地快照排序</small></h3>
+              <ol id="market-turnover" class="leader-list"><li class="leader-empty">等待行情快照</li></ol>
+            </section>
+            <section class="leader-column" aria-labelledby="research-rank-title">
+              <h3 id="research-rank-title">研究排序 <small>仅用缓存分析</small></h3>
+              <ol id="market-research" class="leader-list"><li class="leader-empty">等待量化分析</li></ol>
+            </section>
+          </div>
+          <p id="market-insights-note" class="panel-note">银行分类、行情覆盖率与排名均来自服务端聚合缓存；筛选和排序不会额外消耗 API 额度。</p>
+        </section>
+
+        <section class="panel analysis-panel" aria-labelledby="analysis-title">
+          <header class="panel-header">
+            <div>
+              <p class="panel-kicker">EXPLAINABLE RESEARCH</p>
+              <h2 id="analysis-title"><span id="analysis-name">选择股票</span> <small id="analysis-symbol">—</small></h2>
+            </div>
+            <span id="analysis-status" class="status-pill neutral"><i></i><span>等待分析</span></span>
+          </header>
+          <div id="analysis-summary" class="analysis-summary" aria-live="polite">
+            <div class="analysis-verdict"><span class="analysis-label">研究偏向</span><strong id="analysis-verdict-value">—</strong><small id="analysis-verdict-note">选择银行股后读取缓存分析</small></div>
+            <div class="analysis-score"><span class="analysis-label">趋势分数</span><strong id="analysis-score-value">—</strong><small>规则化研究指标，不是收益承诺</small></div>
+            <div class="analysis-score"><span class="analysis-label">风险等级</span><strong id="analysis-risk-value">—</strong><small id="analysis-risk-note">等待波动率</small></div>
+          </div>
+          <div id="analysis-metrics" class="analysis-metrics" aria-live="polite">
+            <div><span>相对 120 日均线</span><strong>—</strong></div>
+            <div><span>20 / 60 日均线</span><strong>—</strong></div>
+            <div><span>同业排名</span><strong>—</strong></div>
+            <div><span>60 日波动率</span><strong>—</strong></div>
+            <div><span>60-5 日动量</span><strong>—</strong></div>
+            <div><span>60 日回撤</span><strong>—</strong></div>
+          </div>
+          <div id="analysis-research-details" class="research-details" aria-live="polite">
+            <section><h3>研究证据</h3><ul id="analysis-evidence"><li>选择银行股后展示可复核证据</li></ul></section>
+            <section><h3>主要风险</h3><ul id="analysis-risks"><li>等待风险指标与数据质量</li></ul></section>
+            <section><h3>失效条件</h3><ul id="analysis-invalidations"><li>等待策略提供明确失效条件</li></ul></section>
+          </div>
+          <p id="analysis-note" class="panel-note">板块页优先使用服务端已缓存的分析，不会自动逐只请求历史数据；所有结论仅供研究观察，不构成投资建议。</p>
+        </section>
+      </section>
+
+      <div class="content-grid">
+        <section class="panel watchlist-panel" aria-labelledby="watchlist-title">
+          <header class="panel-header">
+            <div>
+              <p class="panel-kicker">BANK UNIVERSE</p>
+              <h2 id="watchlist-title">银行股行情</h2>
+            </div>
+            <span id="watchlist-count" class="count-badge">0 只</span>
+          </header>
+          <div id="bank-toolbar" class="bank-toolbar" role="search" aria-label="银行股本地筛选与排序" hidden>
+            <label class="bank-search"><span class="sr-only">搜索银行名称或代码</span><input id="bank-search" type="search" inputmode="search" autocomplete="off" placeholder="搜索名称 / 代码"></label>
+            <label><span class="sr-only">交易所筛选</span><select id="bank-exchange"><option value="all">全部市场</option><option value="SH">沪市</option><option value="SZ">深市</option></select></label>
+            <label><span class="sr-only">排序方式</span><select id="bank-sort"><option value="change_desc">涨幅从高到低</option><option value="change_asc">涨幅从低到高</option><option value="turnover_desc">成交额从高到低</option><option value="research_desc">研究分数从高到低</option><option value="symbol_asc">代码从小到大</option></select></label>
+          </div>
+          <div class="table-scroll">
+            <table class="quotes-table">
+              <caption class="sr-only">银行股批量行情与缓存量化研究结果；搜索、筛选和排序均在本地完成</caption>
+              <thead>
+                <tr><th scope="col">名称 / 代码</th><th scope="col">最新价</th><th scope="col">涨跌幅</th><th scope="col" class="optional-amount">成交额</th><th scope="col">研究偏向</th></tr>
+              </thead>
+              <tbody id="watchlist-body">
+                <tr><td colspan="5"><div class="inline-loader"><i></i>加载银行板块聚合缓存…</div></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel chart-panel" aria-labelledby="chart-title">
+          <header class="panel-header chart-header">
+            <div>
+              <p class="panel-kicker">PRICE ACTION</p>
+              <h2 id="chart-title"><span id="selected-name">选择银行股</span> <small id="selected-symbol">—</small></h2>
+            </div>
+            <div class="chart-controls" aria-label="K线周期">
+              <button class="period-button" data-period="1m" type="button" disabled title="AShareHub 当前不提供分钟 K 线">分时</button>
+              <button class="period-button active" data-period="1d" type="button">日线</button>
+              <button class="period-button" data-period="1w" type="button" disabled title="AShareHub 当前只提供日线 K 线">周线</button>
+            </div>
+          </header>
+          <div id="chart-summary" class="chart-summary" aria-live="polite">
+            <strong id="selected-price">—</strong><span id="selected-change" class="muted">等待行情</span>
+            <span class="legend"><i class="ma5"></i>MA5 <i class="ma20"></i>MA20</span>
+          </div>
+          <div id="chart-wrap" class="chart-wrap">
+            <svg id="price-chart" viewBox="0 0 800 300" preserveAspectRatio="none" role="img" aria-labelledby="chart-title chart-desc">
+              <desc id="chart-desc">所选股票价格和移动平均线走势图</desc>
+            </svg>
+            <div id="chart-tooltip" class="chart-tooltip" hidden></div>
+            <div id="chart-empty" class="empty-overlay">
+              <span class="empty-icon" aria-hidden="true">⌁</span>
+              <strong>等待银行股选择</strong>
+              <small>板块模式不会自动逐只加载历史日线</small>
+            </div>
+          </div>
+          <div id="volume-wrap" class="volume-wrap" aria-label="成交量柱状图">
+            <div class="volume-label">VOL</div>
+            <svg id="volume-chart" viewBox="0 0 800 88" preserveAspectRatio="none" role="img"><title>成交量</title></svg>
+          </div>
+        </section>
+
+        <section class="panel feed-panel" aria-labelledby="alerts-title">
+          <header class="panel-header">
+            <div><p class="panel-kicker">MONITORING ALERTS</p><h2 id="alerts-title">监控告警</h2></div>
+            <span id="alert-count" class="count-badge warning">0 条</span>
+          </header>
+          <div id="alerts-list" class="event-list" aria-live="polite">
+            <div class="empty-state compact"><span>暂无告警</span><small>触发规则后会实时显示</small></div>
+          </div>
+        </section>
+
+        <section class="panel feed-panel" aria-labelledby="signals-title">
+          <header class="panel-header">
+            <div><p class="panel-kicker">RESEARCH SIGNALS</p><h2 id="signals-title">研究信号</h2></div>
+            <span id="signal-count" class="count-badge accent">0 个</span>
+          </header>
+          <div id="signals-list" class="event-list" aria-live="polite">
+            <div class="empty-state compact"><span>暂无研究信号</span><small>偏向标签不是交易指令</small></div>
+          </div>
+        </section>
+
+        <section class="panel system-panel" aria-labelledby="system-title">
+          <header class="panel-header">
+            <div><p class="panel-kicker">SYSTEM HEALTH</p><h2 id="system-title">系统状态</h2></div>
+            <span id="health-badge" class="status-pill neutral"><i></i><span>检查中</span></span>
+          </header>
+          <dl id="system-metrics" class="system-metrics">
+            <div><dt>数据延迟</dt><dd>—</dd></div>
+            <div><dt>数据源</dt><dd>未配置</dd></div>
+            <div><dt>运行时长</dt><dd>—</dd></div>
+            <div><dt>监控标的</dt><dd>—</dd></div>
+          </dl>
+          <div class="system-foot"><span id="heartbeat-dot" class="heartbeat"></span><span id="heartbeat-text">等待服务心跳</span></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
+    <form method="dialog">
+      <header>
+        <div><p class="panel-kicker">LOCAL CONFIGURATION</p><h2 id="settings-title">数据与平台设置</h2></div>
+        <button class="icon-button close-button" value="cancel" aria-label="关闭设置" type="submit">×</button>
+      </header>
+      <div class="settings-content">
+        <section>
+          <h3>数据源</h3>
+          <div class="source-card">
+            <span class="source-icon" aria-hidden="true">API</span>
+            <div><strong>AShareHub 服务端行情接口</strong><p>通过 HTTP 批量获取自选实时快照，通过日线接口补充历史走势；本地 WebSocket 只转发采集结果。当前接口不提供五档盘口或分钟 K 线，非交易时段返回上一交易日收盘快照。</p></div>
+            <span class="status-pill ok"><i></i><span>服务端管理</span></span>
+          </div>
+        </section>
+        <section>
+          <h3>当前接口约定</h3>
+          <ul class="endpoint-list">
+            <li><code>GET /api/v1/sectors/banks</code><span>银行板块聚合缓存、排名与分析</span></li>
+            <li><code>GET /api/v1/overview</code><span>通用市场概览兼容接口</span></li>
+            <li><code>GET /api/v1/market/quotes</code><span>缓存市场行情（refresh=true 才可能消耗额度）</span></li>
+            <li><code>GET /api/v1/watchlist</code><span>自选批量行情快照</span></li>
+            <li><code>GET /api/v1/bars/{symbol}</code><span>价格、均线和成交量</span></li>
+            <li><code>GET /api/v1/analysis/{symbol}</code><span>趋势、动量与风险分析</span></li>
+            <li><code>GET /api/v1/alerts</code><span>告警记录</span></li>
+            <li><code>GET /api/v1/signals</code><span>策略信号</span></li>
+            <li><code>GET /api/v1/system/status</code><span>服务健康状态</span></li>
+            <li><code>WS /ws/market</code><span>本地采集结果增量推送</span></li>
+          </ul>
+        </section>
+        <p class="privacy-note"><span aria-hidden="true">⌂</span><span><strong>仅本地运行</strong>行情和策略数据由本机服务处理；Windows 一键脚本使用当前用户 DPAPI 加密凭据，并只向服务进程注入 API Key。免费额度为每日 100 次，页面显示的是本机进程估算值，不代表供应商账户的权威账单。</span></p>
+      </div>
+      <footer><button class="primary-button" value="default" type="submit">完成</button></footer>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
