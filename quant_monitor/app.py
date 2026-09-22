@@ -4395,6 +4395,94 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
             return payload
 
+    def _build_market_treemap_snapshot(
+        max_industries: int = 200,
+        max_stocks_per_industry: int = 500,
+    ):
+        """Build the cache-only industry → stock visualization payload.
+
+        The treemap must remain safe to refresh from a browser every few
+        seconds.  It reads only the active provider's already persisted
+        catalogue and quote snapshot; unlike ``refresh=true`` market routes,
+        this function never calls a provider or consumes AShareHub quota.
+        """
+
+        active_runtime = runtime()
+        instruments = cached_provider_instruments()
+        # Read all latest rows for this provider in one SQLite query instead
+        # of constructing a very large ``IN (...)`` clause.  The catalogue
+        # join/filter below still controls which securities can become tiles;
+        # this remains cache-only and avoids SQLite bind-variable limits when
+        # an authorized full-market catalogue is present.
+        quotes = current_provider_items(
+            active_runtime.repository.get_latest_quotes(
+                None,
+                source_prefix=active_runtime.provider.name,
+            )
+        )
+        payload = build_market_treemap(
+            instruments,
+            quotes,
+            max_industries=max_industries,
+            max_stocks_per_industry=max_stocks_per_industry,
+            source=active_runtime.provider.name,
+        )
+        payload["market_status"] = current_market_status()
+        payload["provider"] = active_runtime.provider.name
+        payload["universe_scope"] = "cached_catalogue"
+        payload["updated_at"] = now_market_time()
+        return jsonable(payload)
+
+    app.state.market_treemap_snapshot_builder = _build_market_treemap_snapshot
+
+    @app.get("/api/v1/market/treemap")
+    @app.get("/api/v1/sectors/treemap", include_in_schema=False)
+    async def market_treemap(
+        max_industries: int = Query(default=200, ge=1, le=2000),
+        max_stocks_per_industry: int = Query(default=500, ge=1, le=5000),
+    ):
+        """Return a cache-only industry → stock treemap hierarchy.
+
+        The result is intentionally bounded and short-lived cached.  Querying
+        this route is always local SQLite work (``upstream_requests=0``), so a
+        dashboard reload cannot spend the provider's daily request budget.
+        ``value``/``size`` is turnover-oriented, not market capitalisation;
+        clients should display the accompanying ``size_semantics`` label.
+        """
+
+        now = time.monotonic()
+        cached = app.state.market_treemap_cache_payload
+        # Query bounds are part of the cache key.  Keep a tiny per-process
+        # single-entry cache to avoid retaining arbitrary user input.
+        cache_key = (int(max_industries), int(max_stocks_per_industry))
+        if (
+            cached is not None
+            and cached.get("_cache_key") == cache_key
+            and now < app.state.market_treemap_cache_expires_at
+        ):
+            return {key: value for key, value in cached.items() if key != "_cache_key"}
+
+        async with app.state.market_treemap_cache_lock:
+            now = time.monotonic()
+            cached = app.state.market_treemap_cache_payload
+            if (
+                cached is not None
+                and cached.get("_cache_key") == cache_key
+                and now < app.state.market_treemap_cache_expires_at
+            ):
+                return {key: value for key, value in cached.items() if key != "_cache_key"}
+            payload = await asyncio.to_thread(
+                app.state.market_treemap_snapshot_builder,
+                int(max_industries),
+                int(max_stocks_per_industry),
+            )
+            payload["_cache_key"] = cache_key
+            app.state.market_treemap_cache_payload = payload
+            app.state.market_treemap_cache_expires_at = (
+                time.monotonic() + MARKET_TREEMAP_CACHE_SECONDS
+            )
+            return {key: value for key, value in payload.items() if key != "_cache_key"}
+
     def quote_refresh_metadata(
         result: Optional[QuoteCollectionResult],
         items: Sequence[Quote],

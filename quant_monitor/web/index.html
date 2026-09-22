@@ -90,6 +90,23 @@
         <article class="metric-card skeleton-card"><span class="skeleton short"></span><span class="skeleton value"></span><span class="skeleton medium"></span></article>
       </section>
 
+      <section class="panel sector-treemap-panel" aria-labelledby="sector-treemap-title">
+        <header class="panel-header">
+          <div>
+            <p class="panel-kicker">MARKET MAP</p>
+            <h2 id="sector-treemap-title">行业与个股热力图 <small>面积按成交额，颜色按涨跌幅</small></h2>
+          </div>
+          <div class="treemap-meta">
+            <span id="sector-treemap-source" class="status-pill neutral"><i></i><span>等待行情</span></span>
+            <span id="sector-treemap-asof" class="count-badge">数据时间 —</span>
+          </div>
+        </header>
+        <div id="sector-treemap" class="sector-treemap" aria-live="polite">
+          <div class="sector-treemap-empty">正在读取行业行情…</div>
+        </div>
+        <p id="sector-treemap-note" class="panel-note">行业分类和个股快照仅读取本地缓存；点击个股可查看下方价格走势与研究分析。</p>
+      </section>
+
       <section class="insights-grid" aria-label="银行板块广度与量化分析">
         <section class="panel market-insights-panel" aria-labelledby="market-insights-title">
           <header class="panel-header">
@@ -304,6 +321,7 @@
           <h3>当前接口约定</h3>
           <ul class="endpoint-list">
             <li><code>GET /api/v1/sectors/banks</code><span>银行板块聚合缓存、排名与分析</span></li>
+            <li><code>GET /api/v1/market/treemap</code><span>行业与个股矩形树图缓存（不调用上游）</span></li>
             <li><code>GET /api/v1/overview</code><span>通用市场概览兼容接口</span></li>
             <li><code>GET /api/v1/market/quotes</code><span>缓存市场行情（refresh=true 才可能消耗额度）</span></li>
             <li><code>GET /api/v1/watchlist</code><span>自选批量行情快照</span></li>
@@ -325,6 +343,7 @@
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   <script src="/static/bank-research.js" defer></script>
   <script src="/static/research-report.js" defer></script>
+  <script src="/static/treemap.js" defer></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

@@ -53,6 +53,7 @@ function quantMonitorFreshnessSummary(states) {
     bankSort: "change_desc",
     marketQuotes: [],
     marketSummary: null,
+    sectorTreemapPayload: null,
     analysis: null,
     selectedSymbol: null,
     period: "1d",
@@ -90,6 +91,10 @@ function quantMonitorFreshnessSummary(states) {
     marketTurnover: el("market-turnover"),
     marketResearch: el("market-research"),
     marketInsightsNote: el("market-insights-note"),
+    sectorTreemap: el("sector-treemap"),
+    sectorTreemapSource: el("sector-treemap-source"),
+    sectorTreemapAsOf: el("sector-treemap-asof"),
+    sectorTreemapNote: el("sector-treemap-note"),
     bankQuotaBadge: el("bank-quota-badge"),
     analysisName: el("analysis-name"),
     analysisSymbol: el("analysis-symbol"),
@@ -2090,6 +2095,78 @@ function quantMonitorFreshnessSummary(states) {
     dom.researchCompare.disabled = state.researchSelected.size < 2;
   }
 
+  function renderSectorTreemap(payload) {
+    if (!dom.sectorTreemap) return;
+    state.sectorTreemapPayload = payload || null;
+    const api = globalThis.quantMonitorTreemap;
+    if (!api || typeof api.render !== "function") {
+      dom.sectorTreemap.textContent = "行业热力图组件尚未加载";
+      return;
+    }
+    let normalized;
+    const treemapQuote = (symbol) => {
+      const object = objectFrom(payload);
+      const groups = listFrom(object, ["sectors", "industries", "groups", "items"]);
+      for (const group of groups) {
+        const members = listFrom(group, ["children", "items", "stocks", "quotes", "members"]);
+        const found = members.find((item) => String(firstDefined(item, ["symbol", "code", "ticker"], "")) === String(symbol));
+        if (found) return normalizeQuote(found);
+      }
+      const flat = listFrom(object, ["stocks", "quotes", "records"]);
+      const found = flat.find((item) => String(firstDefined(item, ["symbol", "code", "ticker"], "")) === String(symbol));
+      return found ? normalizeQuote(found) : null;
+    };
+    try {
+      normalized = api.render(dom.sectorTreemap, payload, {
+        onSelect: (symbol) => {
+          const quote = treemapQuote(symbol);
+          if (quote && !state.marketQuotes.some((item) => item.symbol === quote.symbol)) {
+            state.marketQuotes = [...state.marketQuotes, quote];
+          }
+          selectSymbol(symbol);
+        },
+      });
+    } catch (error) {
+      dom.sectorTreemap.textContent = "行业行情暂不可用";
+      if (dom.sectorTreemapNote) dom.sectorTreemapNote.textContent = `热力图渲染失败：${String(error && error.message || error).slice(0, 140)}`;
+      return;
+    }
+    const sectors = Array.isArray(normalized?.sectors) ? normalized.sectors : [];
+    const source = firstDefined(payload, ["source", "provider", "served_from"], "本地缓存");
+    const universeCount = finiteNumber(firstDefined(payload, ["universe_count", "universe_total"], null));
+    const pricedCount = finiteNumber(firstDefined(payload, ["priced_count", "visible_stock_count"], normalized.total));
+    const partial = universeCount !== null && pricedCount !== null && pricedCount < universeCount;
+    setPill(
+      dom.sectorTreemapSource,
+      sectors.length ? String(source) : "等待行业行情",
+      sectors.length ? (partial ? "warning" : "ok") : "neutral",
+    );
+    const asOf = firstDefined(payload, ["as_of", "updated_at", "timestamp"], normalized?.asOf);
+    if (dom.sectorTreemapAsOf) dom.sectorTreemapAsOf.textContent = asOf ? `数据时间 ${formatTime(asOf, true)}` : "数据时间 —";
+    if (dom.sectorTreemapNote) {
+      const sizeSemantics = String(firstDefined(payload, ["size_semantics"], "turnover_preferred") || "turnover_preferred");
+      const sizeText = sizeSemantics.includes("turnover") ? "成交额" : sizeSemantics.includes("market_cap") ? "市值" : sizeSemantics.includes("volume_times_price") ? "成交量×价格" : "可用规模";
+      const scaleNote = sizeSemantics.includes("market_cap") ? "" : "，不等同于市值";
+      dom.sectorTreemapNote.textContent = sectors.length
+        ? `已展示 ${sectors.length} 个行业、${normalized.total || 0} 只个股${universeCount !== null ? `（目录 ${universeCount}，已收到报价 ${pricedCount ?? 0}）` : ""}；面积优先按${sizeText}（缺失时按可用规模${scaleNote}），颜色按涨跌幅。点击个股可查看下方分析。`
+        : "当前没有行业分类或个股行情缓存；页面不会为绘图单独请求上游接口。";
+    }
+  }
+
+  async function loadSectorTreemap() {
+    try {
+      const payload = await fetchJSON(`${API_BASE}/market/treemap`);
+      renderSectorTreemap(payload);
+      return payload;
+    } catch (error) {
+      renderSectorTreemap({ sectors: [], source: "本地缓存" });
+      if (dom.sectorTreemapNote) dom.sectorTreemapNote.textContent = requestErrorMessage(error, "行业热力图接口暂不可用；请确认服务已启动");
+      // The map is an optional visualization.  Do not make a healthy quote
+      // refresh appear failed when an older/custom backend lacks this route.
+      return null;
+    }
+  }
+
   async function loadResearchRuns() {
     try {
       const payload = await fetchJSON(`${API_BASE}/research/runs?limit=20&offset=0`);
@@ -2150,6 +2227,7 @@ function quantMonitorFreshnessSummary(states) {
       }
       const tasks = [
         ...(sectorLoaded ? [] : [loadOverview(), loadWatchlist()]),
+        loadSectorTreemap(),
         loadAlerts(),
         loadSignals(),
         loadSystem(),
@@ -2417,6 +2495,13 @@ function quantMonitorFreshnessSummary(states) {
       }
     });
     window.addEventListener("online", () => { connectWebSocket(); refreshAll(); });
+    let treemapResizeTimer = null;
+    window.addEventListener("resize", () => {
+      window.clearTimeout(treemapResizeTimer);
+      treemapResizeTimer = window.setTimeout(() => {
+        if (state.sectorTreemapPayload) renderSectorTreemap(state.sectorTreemapPayload);
+      }, 150);
+    });
     window.addEventListener("offline", () => {
       setPill(dom.apiStatus, "本地 API 不可用", "bad");
       setPill(dom.wsStatus, "本地推送已断开", "bad");

@@ -37,6 +37,14 @@
     return [];
   }
 
+  function explicitList(value, keys) {
+    const object = objectFrom(value);
+    for (const key of keys || []) {
+      if (Array.isArray(object[key])) return object[key];
+    }
+    return [];
+  }
+
   function first(object, keys, fallback) {
     if (!object || typeof object !== "object") return fallback;
     for (const key of keys) {
@@ -76,7 +84,10 @@
 
   function normalizePayload(payload) {
     const object = objectFrom(payload);
-    const rawSectors = listFrom(object, ["sectors", "industries", "groups", "板块"]);
+    // Do not let the generic `items` fallback turn a flat quote response into
+    // one fake sector per stock.  Flat payloads are grouped below by the
+    // item's industry/sector field (or the explicit 未分类 bucket).
+    const rawSectors = explicitList(object, ["sectors", "industries", "groups", "板块"]);
     const rawItems = listFrom(object, ["items", "stocks", "quotes", "records", "个股"]);
     const grouped = new Map();
     const add = (name, raw, itemFallback) => {
@@ -90,7 +101,7 @@
     rawSectors.forEach((rawSector) => {
       const source = objectFrom(rawSector);
       const sectorName = text(first(source, ["name", "label", "industry", "sector", "行业", "板块"], "未分类"), "未分类");
-      const members = listFrom(source, ["items", "stocks", "quotes", "members", "个股"]);
+      const members = listFrom(source, ["children", "items", "stocks", "quotes", "members", "个股"]);
       if (members.length) members.forEach((item) => add(sectorName, item, sectorName));
       else if (first(source, ["symbol", "code", "ticker"], null)) add(sectorName, source, sectorName);
     });
@@ -147,7 +158,6 @@
     function recurse(remaining, x, y, rw, rh) {
       if (!remaining.length || rw <= 0 || rh <= 0) return;
       const row = [];
-      let remainingArea = remaining.reduce((sum, node) => sum + node._area, 0);
       while (remaining.length) {
         const next = remaining[0];
         const side = Math.min(rw, rh);
@@ -175,7 +185,6 @@
         });
         recurse(remaining, x + rowWidth, y, rw - rowWidth, rh);
       }
-      remainingArea = remainingArea; // documented for debuggers; no mutation of payload
     }
     recurse(scaled, 0, 0, w, h);
     return output.map(({ node, ...rect }) => ({ ...rect, node: (() => { const copy = { ...node }; delete copy._area; return copy; })() }));

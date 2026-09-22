@@ -670,6 +670,18 @@ naive datetime 会被拒绝，避免跨时区日期改变成本归属。
 
 返回沪深银行板块的本地聚合快照，包含股票池来源、报价/历史/分析覆盖率、板块涨跌宽度、中位涨幅、涨跌/成交额/量化分排名、每只银行的缓存行情与可解释研究摘要，以及本机额度估算。固定返回 `served_from=sqlite_cache`、`upstream_requests=0`；刷新、搜索和排序不会调用 AShareHub。
 
+### `GET /api/v1/market/treemap`
+
+返回行业 → 个股的缓存矩形树图数据；兼容别名为
+`GET /api/v1/sectors/treemap`。接口只读取当前 provider 已落盘的证券目录与最新报价，固定
+`served_from=sqlite_cache`、`upstream_requests=0`，不会因为刷新看板而消耗 AShareHub 日额度。
+顶层 `sectors` 与 `items` 是兼容别名；每个行业组的 `children` 与 `items` 也是兼容别名。
+个股 `value`/`size` 优先使用成交额，缺失时使用成交量×最新价，仍缺失时使用明确标记为
+`placeholder` 的占位值；它们不是市值。`size_semantics` 和 `change_semantics` 说明口径，
+不要将图块面积解释为市值或交易指令。未收到报价的目录证券不生成图块，但会计入
+`unpriced_count`；没有行业分类的证券进入 `未分类`。可选 `max_industries`（1–2000）和
+`max_stocks_per_industry`（1–5000）控制响应大小。
+
 量化摘要使用至少 130 根未复权日线，并要求至少 15 只银行具有同一 `bar_as_of`。不足时 `analysis_ready=0` 并通过 `analysis_reason` 区分历史不足和共同日期不一致，不会用零值伪造得分。每只股票的摘要还包含 `entry_eligible`、`gate_failures`、`entry_failure_reasons` 与 `exit_reasons`，明确列出未入选的门控原因、分数/复核条件和风险退出原因。`gate_failures` 使用稳定门禁名（如 `breadth_ok`、`liquidity_ok`）；`entry_failure_reasons` 额外解释所有布尔门禁通过但仍未入选的情况（例如 `score_below_entry_percentile`、`review_not_due`）。当缓存只有旧版 `bars` 投影、缺少完整且 accepted 的不可变 observation 时，API 会强制追加 `data_lineage_incomplete` 并将 `entry_eligible=false`。此时因子排名仍可用于诊断，但用户-facing 的 `research_action` 与 `recommendation.action` 会是 `insufficient_data`（原始模型动作保存在 `model_action`），并且 `data_quality.decision_ready=false`，避免把不完整数据误读为 BUY/SELL 或风险结论。板块 `coverage.analysis_ready` 表示纯因子模型成功计算的数量，兼容历史客户端；`coverage.quality_ready` 与 `coverage.decision_ready` 才表示具备 accepted 不可变观测证据的数量。每只结果同时返回 `analysis_ready`、`decision_ready_reason` 和 `calculation_input`，避免把“有排名”误读为决策级数据。研究标签不是订单或收益承诺。
 
 银行 `analysis.indicators` 仅填充与银行模型口径一致的 60/120 日指标（比例小数），通用的 `return_5`、`return_20`、`annualized_volatility_20` 保持 `null`，不会把不同观察窗口冒充成 20 日指标。`factor_percentiles`、`factor_weights`、`factor_contributions` 和 `score_thresholds` 可用于复算页面的评分拆解；贡献分必须等于分位数乘权重，合计才是综合分。

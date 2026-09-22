@@ -107,6 +107,7 @@ def _stock_tile(
         "symbol": quote.symbol,
         "name": name,
         "industry": industry,
+        "exchange": getattr(getattr(instrument, "exchange", None), "value", None),
         "value": float(size),
         "size": float(size),
         "size_basis": size_basis,
@@ -117,6 +118,9 @@ def _stock_tile(
         "change_pct": pct,
         "volume": int(quote.volume),
         "turnover": str(quote.turnover),
+        # Keep the common quote naming available to generic dashboard
+        # components while retaining the explicit turnover semantics above.
+        "amount": str(quote.turnover),
         "timestamp": _timestamp(quote.timestamp),
         "source": quote.source,
         "quote_status": "available",
@@ -202,6 +206,12 @@ def build_market_treemap(
                 "advancers": sum(1 for item in visible if (item["pct_change"] or 0) > 0),
                 "decliners": sum(1 for item in visible if (item["pct_change"] or 0) < 0),
                 "unchanged": sum(1 for item in visible if item["pct_change"] == 0),
+                "amount": str(
+                    sum(
+                        (Decimal(str(item.get("turnover") or "0")) for item in visible),
+                        Decimal("0"),
+                    )
+                ),
                 "priced_count": len(visible),
                 "omitted_count": len(omitted),
                 "children": visible,
@@ -218,6 +228,8 @@ def build_market_treemap(
     priced_symbols = len(latest)
     timestamps = [quote.timestamp for quote in latest.values()]
     as_of = max(timestamps).isoformat() if timestamps else None
+    visible_items = [item for group in industries for item in group["children"]]
+    known_pct = [item["pct_change"] for item in visible_items if item["pct_change"] is not None]
     return {
         "items": industries,
         "sectors": industries,
@@ -228,6 +240,18 @@ def build_market_treemap(
         "unpriced_count": max(0, all_symbols - priced_symbols),
         "omitted_industry_count": len(omitted_industries),
         "as_of": as_of,
+        "summary": {
+            "count": len(visible_items),
+            "advancers": sum(1 for item in visible_items if (item["pct_change"] or 0) > 0),
+            "decliners": sum(1 for item in visible_items if (item["pct_change"] or 0) < 0),
+            "unchanged": sum(1 for item in visible_items if item["pct_change"] == 0),
+            "average_pct_change": (
+                round(sum(known_pct) / len(known_pct), 6) if known_pct else None
+            ),
+            "total_turnover": str(
+                sum((Decimal(str(item.get("turnover") or "0")) for item in visible_items), Decimal("0"))
+            ),
+        },
         "source": source,
         "size_semantics": "turnover_preferred; volume_times_price_fallback; placeholder_when_missing",
         "change_semantics": "turnover_weighted_pct_change",
