@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
@@ -21,6 +23,7 @@ from quant_monitor.data_sources import (
 )
 from quant_monitor.domain import EventType, MarketEvent, Quote, now_market_time
 from quant_monitor.market import market_status
+from quant_monitor.trading_calendar import DEFAULT_TRADING_CALENDAR, TradingCalendar
 from quant_monitor.serialization import alert_dict, jsonable, quote_dict, signal_dict
 from quant_monitor.services import (
     CollectionResult,
@@ -33,6 +36,7 @@ from quant_monitor.storage import SQLiteRepository
 from quant_monitor.strategies import (
     BankDailyMultifactorStrategy,
     MovingAverageCrossStrategy,
+    StrategyRegistry,
 )
 from quant_monitor.universes import (
     BANK_STOCK_FALLBACK,
@@ -54,6 +58,115 @@ STOCK_NAMES.update(dict(BANK_STOCK_FALLBACK))
 LOGGER = logging.getLogger(__name__)
 MINIMUM_AUTHORITATIVE_BANK_CATALOGUE = len(BANK_STOCK_FALLBACK) - 2
 MINIMUM_AUTHORITATIVE_STOCK_CATALOGUE = 1_000
+
+
+def build_data_readiness(
+    *,
+    configured_symbols: int,
+    received_symbols: int,
+    freshness_state: str,
+    market_is_trading: bool,
+) -> Dict[str, Any]:
+    """Derive the cache-only market-data readiness contract.
+
+    Keep this rule in one place so ``system_status`` and ``/ready`` cannot
+    drift.  A closed market may use prior-close snapshots, but every
+    configured symbol must still be represented; a partial universe is not a
+    usable data set merely because the exchange is closed.
+    """
+
+    configured = max(0, int(configured_symbols))
+    received = max(0, int(received_symbols))
+    state = str(freshness_state or "unknown")
+    if configured == 0:
+        ready = True
+        reason = "no_symbols_configured"
+    elif market_is_trading:
+        ready = state in {"fresh", "untracked"} and received >= configured
+        reason = "fresh_quotes_required"
+    else:
+        ready = received >= configured and state not in {"missing", "future_timestamp"}
+        reason = "market_closed_cached_close_allowed"
+    return {
+        "ready": bool(ready),
+        "reason": reason,
+        "configured_symbols": configured,
+        "received_symbols": received,
+        "freshness_state": state,
+        "market_is_trading": bool(market_is_trading),
+    }
+
+
+def build_calendar_readiness(
+    *,
+    provider_name: str,
+    calendar_enabled: bool,
+    calendar_source: Optional[str],
+    calendar_error_type: Optional[str],
+    configured_symbols: int,
+) -> Dict[str, Any]:
+    """Derive the cache-only trading-calendar readiness contract.
+
+    This gate deliberately checks only the provider's already-loaded calendar
+    state; it never refreshes a snapshot or spends an upstream request.  The
+    exchange cache is considered usable only when both SSE and SZSE rows were
+    loaded (the provider reports this as ``asharehub`` or
+    ``asharehub_cache``).  A partial, expired, corrupt, or budget-protected
+    cache remains an explicit fallback and must not satisfy an opt-in
+    ``require_calendar`` readiness probe.
+    """
+
+    configured = max(0, int(configured_symbols))
+    provider = str(provider_name or "").strip().lower()
+    source = str(calendar_source or "weekday_fallback")
+    error = str(calendar_error_type).strip() if calendar_error_type else None
+    if provider != "asharehub" or configured == 0:
+        return {
+            "ready": True,
+            "required": False,
+            "reason": "not_required" if provider != "asharehub" else "no_symbols_configured",
+            "provider": provider,
+            "enabled": bool(calendar_enabled),
+            "source": source,
+            "error_type": error,
+            "configured_symbols": configured,
+        }
+    if not calendar_enabled:
+        reason = "calendar_disabled"
+        ready = False
+    elif source in {"asharehub", "asharehub_cache"} and not error:
+        reason = "exchange_calendar_loaded"
+        ready = True
+    else:
+        reason = "exchange_calendar_unavailable"
+        ready = False
+    return {
+        "ready": ready,
+        "required": True,
+        "reason": reason,
+        "provider": provider,
+        "enabled": bool(calendar_enabled),
+        "source": source,
+        "error_type": error,
+        "configured_symbols": configured,
+    }
+
+
+_ERROR_TYPE_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*(?:Error|Exception)\b")
+
+
+def _public_error_type(error: Any) -> Optional[str]:
+    """Extract only a safe exception class name for public health payloads.
+
+    ``MonitoringService`` keeps a richer, process-local message for logs and
+    alert records.  That message can contain provider response text, URLs, or
+    other sensitive material, so the HTTP status projection must never echo it.
+    """
+
+    if not error:
+        return None
+    match = _ERROR_TYPE_PATTERN.search(str(error))
+    return match.group(0) if match else "CollectionError"
 
 
 class WebSocketHub:
@@ -104,7 +217,15 @@ class ApplicationRuntime:
         db_path = Path(settings.database_path)
         if not db_path.is_absolute():
             db_path = Path(__file__).resolve().parent.parent / db_path
-        self.repository = SQLiteRepository(db_path)
+        # Pass the lifecycle deadline into SQLite itself.  ``asyncio.to_thread``
+        # keeps migrations off the event loop, but cancelling that future cannot
+        # interrupt a native sqlite call; without an inner deadline a timed-out
+        # startup could still hold the repository lock while shutdown tries to
+        # close it.  The repository therefore stops waiting at the same bound.
+        self.repository = SQLiteRepository(
+            db_path,
+            initialization_timeout_seconds=settings.startup_database_timeout_seconds,
+        )
         provider_name = str(settings.data_provider).strip().lower()
         if provider_name == "mock":
             self.provider = MockMarketDataProvider(
@@ -115,6 +236,9 @@ class ApplicationRuntime:
             budget_path = Path(settings.asharehub_budget_path)
             if not budget_path.is_absolute():
                 budget_path = Path(__file__).resolve().parent.parent / budget_path
+            trade_calendar_path = Path(settings.asharehub_trade_calendar_path)
+            if not trade_calendar_path.is_absolute():
+                trade_calendar_path = Path(__file__).resolve().parent.parent / trade_calendar_path
             self.provider = AShareHubMarketDataProvider(
                 api_key=settings.asharehub_api_key,
                 symbols=settings.watchlist,
@@ -129,6 +253,9 @@ class ApplicationRuntime:
                 retries=settings.asharehub_retries,
                 retry_backoff_seconds=settings.asharehub_retry_backoff_seconds,
                 strict_symbols=settings.asharehub_strict_symbols,
+                trade_calendar_enabled=settings.asharehub_trade_calendar_enabled,
+                trade_calendar_cache_seconds=settings.asharehub_trade_calendar_cache_seconds,
+                trade_calendar_path=trade_calendar_path,
             )
         elif provider_name == "alltick":
             self.provider = AllTickMarketDataProvider(
@@ -168,6 +295,10 @@ class ApplicationRuntime:
                     settings.data_provider
                 )
             )
+        # Providers may expose a cache-only, finite exchange calendar.  Start
+        # on the explicit weekday fallback and refresh this view after a
+        # provider cache is hydrated; no network request is made here.
+        self.trading_calendar: TradingCalendar = DEFAULT_TRADING_CALENDAR
         self.quote_stale_after_seconds = (
             max(
                 30.0,
@@ -189,13 +320,26 @@ class ApplicationRuntime:
         self.event_bus = EventBus()
         ordinary_strategies = ()
         cohort_strategies = ()
+        strategy_registry = StrategyRegistry()
         if settings.strategy_profile == "moving_average_cross":
+            # Keep the runtime on the same allow-listed construction path as
+            # configuration/API catalogue consumers.  The registry accepts
+            # concrete built-ins only; no import path or eval is involved.
+            strategy_registry.register(
+                "moving_average_cross", MovingAverageCrossStrategy
+            )
             ordinary_strategies = (
-                MovingAverageCrossStrategy(interval=settings.bar_interval),
+                strategy_registry.create(
+                    "moving_average_cross", interval=settings.bar_interval
+                ),
             )
         else:
+            strategy_registry.register(
+                "bank_daily_multifactor_v1", BankDailyMultifactorStrategy
+            )
             cohort_strategies = (
-                BankDailyMultifactorStrategy(
+                strategy_registry.create(
+                    "bank_daily_multifactor_v1",
                     min_history=settings.bank_strategy_min_history,
                     min_universe=settings.bank_strategy_min_universe,
                     entry_percentile=settings.bank_strategy_entry_percentile,
@@ -210,6 +354,7 @@ class ApplicationRuntime:
                     corporate_action_gap=(
                         settings.bank_strategy_corporate_action_gap
                     ),
+                    fundamental_weight=settings.bank_strategy_fundamental_weight,
                 ),
             )
         self.monitor = MonitoringService(
@@ -222,6 +367,7 @@ class ApplicationRuntime:
             poll_interval=settings.poll_interval_seconds,
             bar_interval=settings.bar_interval,
             bar_limit=settings.history_bar_count,
+            trading_calendar=self.trading_calendar,
         )
         self.hub = WebSocketHub()
         self.subscription: Subscription = None
@@ -229,7 +375,11 @@ class ApplicationRuntime:
         self._instrument_task = None
         self._catalogue_refresh_task: Optional["asyncio.Task[None]"] = None
         self._history_bootstrap_task: Optional["asyncio.Task[None]"] = None
+        self._startup_started_at: Optional[datetime] = None
         self._startup_completed_at: Optional[datetime] = None
+        self._startup_duration_ms: Optional[float] = None
+        self._startup_phase = "not_started"
+        self._startup_error_type: Optional[str] = None
         self._history_bootstrap_total = 0
         self._history_bootstrap_ready = 0
         self._history_bootstrap_deferred = False
@@ -242,6 +392,133 @@ class ApplicationRuntime:
         self._history_bootstrap_last_check_at: Optional[datetime] = None
         self._last_research_signature: Optional[Tuple[Tuple[str, str, int], ...]] = None
         self._refresh_strategy_profile()
+
+    def current_trading_calendar(self) -> TradingCalendar:
+        """Return the provider calendar view used by quality and research.
+
+        AShareHub loads its finite calendar lazily and may refresh it while
+        the monitor is already running.  The optional provider hook is
+        intentionally cache-only; providers without one stay on the explicit
+        weekday fallback.  Keep the collector bound to the same object so
+        ingestion, data-quality reports and backtests share one identity.
+        """
+
+        getter = getattr(self.provider, "get_trading_calendar", None)
+        selected = None
+        if callable(getter):
+            try:
+                selected = getter(self.symbols)
+            except Exception:
+                selected = None
+        if selected is None:
+            selected = DEFAULT_TRADING_CALENDAR
+        self.trading_calendar = selected
+        collector = getattr(getattr(self, "monitor", None), "collector", None)
+        if collector is not None:
+            collector.trading_calendar = selected
+        return selected
+
+    def _cached_provider_instruments(self):
+        """Load the provider-owned security master without blocking the event loop."""
+
+        return [
+            item
+            for item in self.repository.list_instruments(active_only=False)
+            if str(item.metadata.get("source") or "") == self.provider.name
+        ]
+
+    def _cached_bars_for_startup(self):
+        """Read the bounded startup bar cache in one worker-thread operation."""
+
+        cached_bars = []
+        intervals = tuple(dict.fromkeys((self.settings.bar_interval, "1d")))
+        for symbol in self.symbols:
+            for interval in intervals:
+                limit = (
+                    self.settings.history_bar_count
+                    if interval == self.settings.bar_interval
+                    else 2
+                )
+                cached_bars.extend(
+                    bar
+                    for bar in self.repository.get_bars(
+                        symbol,
+                        interval=interval,
+                        limit=limit,
+                        source_prefix=self.provider.name,
+                    )
+                    if str(bar.source).startswith(self.provider.name)
+                )
+        return cached_bars
+
+    def _set_startup_phase(self, phase: str) -> float:
+        self._startup_phase = phase
+        LOGGER.info(
+            "application startup phase=%s status=starting provider=%s",
+            phase,
+            self.provider.name,
+        )
+        return time.perf_counter()
+
+    def _complete_startup_phase(self, phase: str, started: float, **details: Any) -> None:
+        fields = " ".join("{}={}".format(key, value) for key, value in details.items())
+        LOGGER.info(
+            "application startup phase=%s status=complete duration_ms=%.1f%s",
+            phase,
+            (time.perf_counter() - started) * 1000.0,
+            " " + fields if fields else "",
+        )
+
+    async def _initialize_repository_with_progress(self) -> None:
+        """Initialize SQLite with lock-wait heartbeats and a hard deadline.
+
+        SQLite's busy timeout only bounds an individual connection attempt;
+        the repository may retry several times.  A separate runtime deadline
+        keeps an abandoned writer lock from holding the ASGI lifespan open
+        indefinitely, while preserving the one-second progress heartbeat.
+        """
+
+        task = asyncio.create_task(
+            asyncio.to_thread(self.repository.initialize),
+            name="sqlite-initialize",
+        )
+        started = time.perf_counter()
+        timeout_seconds = float(self.settings.startup_database_timeout_seconds)
+        deadline = started + timeout_seconds
+        try:
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    LOGGER.error(
+                        "application startup phase=database_initialize status=timeout "
+                        "duration_ms=%.1f timeout_seconds=%.3f database=%s; "
+                        "close other processes using this database and retry",
+                        (time.perf_counter() - started) * 1000.0,
+                        timeout_seconds,
+                        str(Path(self.repository.path).resolve()),
+                    )
+                    raise RuntimeError(
+                        "SQLite initialization timed out after {:.3f} seconds; "
+                        "another process may hold the database lock".format(
+                            timeout_seconds
+                        )
+                    )
+                done, _ = await asyncio.wait(
+                    (task,), timeout=min(1.0, remaining)
+                )
+                if done:
+                    await task
+                    return
+                LOGGER.warning(
+                    "application startup phase=database_initialize status=waiting "
+                    "duration_ms=%.1f database=%s; another process may hold the SQLite lock",
+                    (time.perf_counter() - started) * 1000.0,
+                    str(Path(self.repository.path).resolve()),
+                )
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
 
     def _refresh_strategy_profile(self) -> None:
         """Enable the configured strategy only when its universe is meaningful."""
@@ -263,6 +540,7 @@ class ApplicationRuntime:
                     corporate_action_gap=(
                         self.settings.bank_strategy_corporate_action_gap
                     ),
+                    fundamental_weight=self.settings.bank_strategy_fundamental_weight,
                 ),
             )
 
@@ -356,7 +634,7 @@ class ApplicationRuntime:
             ):
                 LOGGER.warning("bank catalogue refresh contains mixed source metadata")
                 return
-            self.repository.replace_instruments(instruments)
+            await asyncio.to_thread(self.repository.replace_instruments, instruments)
             LOGGER.info(
                 "bank catalogue refreshed in background: %s active bank symbols",
                 len(dynamic_banks),
@@ -369,7 +647,7 @@ class ApplicationRuntime:
     async def _refresh_instruments(self) -> None:
         try:
             instruments = await self.provider.fetch_instruments()
-            self.repository.upsert_instruments(instruments)
+            await asyncio.to_thread(self.repository.upsert_instruments, instruments)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -401,9 +679,9 @@ class ApplicationRuntime:
                 for item in items
             ):
                 raise ValueError("AShareHub instrument catalogue has mixed sources")
-            self.repository.replace_instruments(items)
+            await asyncio.to_thread(self.repository.replace_instruments, items)
         else:
-            self.repository.upsert_instruments(items)
+            await asyncio.to_thread(self.repository.upsert_instruments, items)
         return items
 
     def _history_ready_symbols(self) -> Set[str]:
@@ -619,13 +897,34 @@ class ApplicationRuntime:
             )
 
     async def start(self) -> None:
-        self.repository.initialize()
+        startup_timer = time.perf_counter()
+        self._startup_started_at = now_market_time()
+        self._startup_completed_at = None
+        self._startup_duration_ms = None
+        self._startup_error_type = None
+        phase_timer = self._set_startup_phase("database_initialize")
         try:
+            # SQLite migration and contract validation are synchronous. Run
+            # them off-loop so a slow disk, antivirus hook or lock wait does
+            # not freeze the ASGI event loop without an actionable phase log.
+            await self._initialize_repository_with_progress()
+            self._complete_startup_phase(
+                "database_initialize",
+                phase_timer,
+                schema_version=self.repository.SCHEMA_VERSION,
+            )
+            restored_jobs = await asyncio.to_thread(
+                self.monitor.restore_collection_jobs
+            )
+            if restored_jobs:
+                LOGGER.info("restored %s durable collector job(s)", restored_jobs)
+            phase_timer = self._set_startup_phase("cache_hydration")
             # A process can terminate after recording the start of a provider
             # request but before committing its terminal batch.  Such rows
             # must never remain indistinguishable from work still in flight.
-            abandoned_batches = self.repository.abandon_running_collection_batches(
-                now_market_time()
+            abandoned_batches = await asyncio.to_thread(
+                self.repository.abandon_running_collection_batches,
+                now_market_time(),
             )
             if abandoned_batches:
                 LOGGER.warning(
@@ -633,11 +932,9 @@ class ApplicationRuntime:
                     abandoned_batches,
                 )
             if self.provider.name == "asharehub":
-                cached_instruments = [
-                    item
-                    for item in self.repository.list_instruments(active_only=False)
-                    if str(item.metadata.get("source") or "") == "asharehub"
-                ]
+                cached_instruments = await asyncio.to_thread(
+                    self._cached_provider_instruments
+                )
                 # A partially corrupted or incomplete security master must not
                 # be promoted into a fresh seven-day provider cache. In bank
                 # mode, only seed a catalogue that meets both conservative
@@ -659,35 +956,21 @@ class ApplicationRuntime:
                 seed_instruments = getattr(self.provider, "seed_instruments", None)
                 if seed_instruments is not None:
                     seed_instruments(cached_instruments)
-            self._configure_research_universe_from_cache()
+            await asyncio.to_thread(self._configure_research_universe_from_cache)
             seed_quotes = getattr(self.provider, "seed_quotes", None)
+            cached_quotes = []
             if seed_quotes is not None:
-                cached_quotes = self.repository.get_latest_quotes(
+                cached_quotes = await asyncio.to_thread(
+                    self.repository.get_latest_quotes,
                     self.symbols,
                     source_prefix=self.provider.name,
                 )
                 seed_quotes(cached_quotes)
+                self.monitor.remember_quotes(cached_quotes)
             seed_bars = getattr(self.provider, "seed_bars", None)
+            cached_bars = []
             if seed_bars is not None:
-                cached_bars = []
-                intervals = tuple(dict.fromkeys((self.settings.bar_interval, "1d")))
-                for symbol in self.symbols:
-                    for interval in intervals:
-                        limit = (
-                            self.settings.history_bar_count
-                            if interval == self.settings.bar_interval
-                            else 2
-                        )
-                        cached_bars.extend(
-                            bar
-                            for bar in self.repository.get_bars(
-                                symbol,
-                                interval=interval,
-                                limit=limit,
-                                source_prefix=self.provider.name,
-                            )
-                            if str(bar.source).startswith(self.provider.name)
-                        )
+                cached_bars = await asyncio.to_thread(self._cached_bars_for_startup)
                 seed_bars(cached_bars)
             # AShareHub history is filled by a separate one-symbol-at-a-time
             # background job.  The normal monitor starts quote-only so the two
@@ -697,10 +980,19 @@ class ApplicationRuntime:
                 self._history_bootstrap_ready = len(self._history_ready_symbols())
                 self._history_bootstrap_state = "scheduled"
                 self.monitor.collector.collect_bars_enabled = False
+            self._complete_startup_phase(
+                "cache_hydration",
+                phase_timer,
+                symbols=len(self.symbols),
+                quotes=len(cached_quotes),
+                bars=len(cached_bars),
+                universe_source=self.universe_source,
+            )
+            phase_timer = self._set_startup_phase("service_activation")
             start_realtime = getattr(self.provider, "start_realtime", None)
             if start_realtime is not None:
                 await start_realtime()
-            if self.provider.name not in {"alltick", "asharehub"}:
+            if self.provider.name == "mock":
                 await self._refresh_instruments()
             self.subscription = await self.event_bus.subscribe(None, self._on_event)
             self.started_at = now_market_time()
@@ -713,8 +1005,19 @@ class ApplicationRuntime:
             else:
                 await self.monitor.start(collect_immediately=True)
             self._startup_completed_at = now_market_time()
+            self._startup_phase = "ready"
+            self._startup_duration_ms = round(
+                (time.perf_counter() - startup_timer) * 1000.0,
+                3,
+            )
+            self._complete_startup_phase(
+                "service_activation",
+                phase_timer,
+                monitor_running=self.monitor.running,
+            )
             LOGGER.info(
-                "application runtime ready; initial %s collection continues in background",
+                "application runtime ready duration_ms=%.1f; initial %s collection continues in background",
+                self._startup_duration_ms,
                 self.provider.name,
             )
             if self.provider.name == "asharehub":
@@ -731,15 +1034,29 @@ class ApplicationRuntime:
                     self._refresh_bank_catalogue(),
                     name="asharehub-bank-catalogue-refresh",
                 )
-            if self.provider.name == "alltick":
+            if self.provider.name in {"alltick", "akshare"}:
                 # Static info is optional enrichment and the free plan is
-                # globally rate-limited. Do not block FastAPI startup or the
-                # core tick subscription while permission isolation completes.
+                # rate-limited or network-bound. Do not block FastAPI startup
+                # while provider discovery completes.
                 self._instrument_task = asyncio.create_task(
                     self._refresh_instruments(),
-                    name="alltick-static-instruments",
+                    name="{}-static-instruments".format(self.provider.name),
                 )
-        except BaseException:
+        except BaseException as exc:
+            failed_phase = self._startup_phase
+            self._startup_phase = "failed"
+            self._startup_completed_at = None
+            self._startup_error_type = type(exc).__name__
+            self._startup_duration_ms = round(
+                (time.perf_counter() - startup_timer) * 1000.0,
+                3,
+            )
+            LOGGER.error(
+                "application startup failed phase=%s duration_ms=%.1f error_type=%s",
+                failed_phase,
+                self._startup_duration_ms,
+                self._startup_error_type,
+            )
             history_task = self._history_bootstrap_task
             self._history_bootstrap_task = None
             if history_task is not None:
@@ -761,11 +1078,18 @@ class ApplicationRuntime:
             if self.subscription is not None:
                 await self.event_bus.unsubscribe(self.subscription)
                 self.subscription = None
+            # Activation can fail after monitor.start() has scheduled the
+            # collector. Stop that task before closing its provider/database;
+            # otherwise a failed lifespan can leave writes against a closed DB.
+            await self.monitor.stop()
             await self.provider.close()
             self.repository.close()
             raise
 
     async def stop(self) -> None:
+        # Revoke readiness before the first await so a concurrent probe cannot
+        # report an accepting service while its dependencies are being closed.
+        self._startup_phase = "stopping"
         history_task = self._history_bootstrap_task
         self._history_bootstrap_task = None
         if history_task is not None:
@@ -792,10 +1116,12 @@ class ApplicationRuntime:
             await self.event_bus.unsubscribe(self.subscription)
             self.subscription = None
         self.repository.close()
+        self._startup_phase = "stopped"
 
     async def _on_event(self, event: MarketEvent) -> None:
         payload = event.payload
         if isinstance(payload, Quote):
+            self.monitor.remember_quotes([payload])
             data = quote_dict(
                 payload,
                 self.instrument_name(payload.symbol),
@@ -826,15 +1152,130 @@ class ApplicationRuntime:
         latency = max(0.0, (now - last).total_seconds() * 1000) if last else None
         running = bool(snapshot.get("running"))
         error = snapshot.get("last_error")
+        public_error_type = _public_error_type(error)
+        # A successful collector iteration does not prove that every quote is
+        # current: providers may return a partial snapshot or replay a cached
+        # timestamp.  Expose per-universe freshness counts so operators can
+        # distinguish a healthy process from a healthy market feed.  This is
+        # deliberately derived from in-memory normalized Quote objects and
+        # never triggers provider I/O.
+        monitored_symbols = tuple(self.symbols)
+        latest_quotes = snapshot.get("quotes") or {}
+        freshness_threshold = self.quote_stale_after_seconds
+        fresh_count = stale_count = missing_count = future_count = 0
+        ages = []
+        quote_timestamps = []
+        for symbol in monitored_symbols:
+            quote = latest_quotes.get(symbol)
+            if quote is None:
+                missing_count += 1
+                continue
+            age_seconds = (now - quote.timestamp).total_seconds()
+            quote_timestamps.append(quote.timestamp)
+            if age_seconds < -5.0:
+                future_count += 1
+            elif freshness_threshold is not None and age_seconds > float(freshness_threshold):
+                stale_count += 1
+            else:
+                fresh_count += 1
+            ages.append(max(0.0, age_seconds))
+        received_count = fresh_count + stale_count + future_count
+        if not monitored_symbols:
+            freshness_state = "unknown"
+        elif received_count == 0:
+            freshness_state = "missing"
+        elif future_count:
+            freshness_state = "future_timestamp"
+        elif stale_count and fresh_count == 0:
+            freshness_state = "stale"
+        elif stale_count or missing_count:
+            freshness_state = "partial"
+        elif freshness_threshold is None:
+            freshness_state = "untracked"
+        else:
+            freshness_state = "fresh"
+        quote_freshness = {
+            "state": freshness_state,
+            "configured_symbols": len(monitored_symbols),
+            "received_symbols": received_count,
+            "fresh_symbols": fresh_count,
+            "stale_symbols": stale_count,
+            "missing_symbols": missing_count,
+            "future_timestamp_symbols": future_count,
+            "threshold_seconds": freshness_threshold,
+            "oldest_age_seconds": round(max(ages), 3) if ages else None,
+            "newest_timestamp": max(quote_timestamps).isoformat() if quote_timestamps else None,
+            "as_of": now.isoformat(),
+        }
+        realtime_status = getattr(self.provider, "realtime_status", None)
+        realtime = dict(realtime_status) if realtime_status is not None else {}
+        calendar_readiness = build_calendar_readiness(
+            provider_name=self.provider.name,
+            calendar_enabled=bool(realtime.get("trade_calendar_enabled", False)),
+            calendar_source=realtime.get("trade_calendar_source"),
+            calendar_error_type=realtime.get("trade_calendar_error_type"),
+            configured_symbols=len(monitored_symbols),
+        )
         provider_issues = []
         provider_status: Dict[str, Any] = {
             "name": self.provider.name,
             "state": "running" if running else "starting",
+            "quote_freshness": quote_freshness,
         }
-        realtime_status = getattr(self.provider, "realtime_status", None)
         if realtime_status is not None:
-            realtime = dict(realtime_status)
             provider_status["realtime"] = realtime
+            # Preserve the provider's response-shape diagnostics as a stable
+            # aggregate in the public runtime contract.  The raw realtime
+            # status remains available for backwards compatibility, while
+            # this explicit object lets API/metrics consumers distinguish an
+            # empty/partial upstream response from a transport failure.  Do
+            # not expose per-row payloads or credentials here; the missing
+            # symbol list is already normalized by the provider and is useful
+            # for the local operator-facing status endpoint only.
+            if self.provider.name == "asharehub":
+                response_rows = realtime.get("last_quote_response_rows")
+                parsed_symbols = realtime.get("last_quote_parsed_symbols")
+                dropped_rows = realtime.get("last_quote_dropped_rows")
+                invalid_rows = realtime.get("last_quote_invalid_rows")
+                unexpected_rows = realtime.get("last_quote_unexpected_rows")
+                duplicate_rows = realtime.get("last_quote_duplicate_rows")
+                conflict_rows = realtime.get("last_quote_conflict_rows")
+                missing_symbols = realtime.get("last_quote_missing_symbols") or []
+                try:
+                    requested_rows = int(
+                        realtime.get("last_quote_requested_symbols")
+                        or realtime.get("requested_symbols")
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    requested_rows = 0
+                try:
+                    parsed_count = int(parsed_symbols) if parsed_symbols is not None else None
+                except (TypeError, ValueError):
+                    parsed_count = None
+                response_quality = {
+                    "response_rows": response_rows,
+                    "parsed_symbols": parsed_symbols,
+                    "dropped_rows": dropped_rows,
+                    "invalid_rows": invalid_rows,
+                    "unexpected_rows": unexpected_rows,
+                    "duplicate_rows": duplicate_rows,
+                    "conflict_rows": conflict_rows,
+                    "missing_symbols": list(missing_symbols)
+                    if isinstance(missing_symbols, (list, tuple))
+                    else [],
+                    "missing_count": len(missing_symbols)
+                    if isinstance(missing_symbols, (list, tuple))
+                    else 0,
+                    "requested_symbols": requested_rows,
+                    "coverage_ratio": (
+                        round(parsed_count / requested_rows, 6)
+                        if parsed_count is not None and requested_rows > 0
+                        else None
+                    ),
+                    "as_of": realtime.get("last_quote_success_at"),
+                }
+                provider_status["quote_response_quality"] = response_quality
             provider_status["mode"] = realtime.get("mode") or (
                 "websocket" if self.provider.name == "alltick" else "polling"
             )
@@ -920,6 +1361,11 @@ class ApplicationRuntime:
                 provider_issues.append("static_info_unavailable")
         if error:
             provider_issues.append("collector_error")
+        if self._startup_phase == "ready":
+            if not running:
+                provider_issues.append("collector_stopped")
+            if not self.repository.initialized:
+                provider_issues.append("database_disconnected")
         if self.provider.name == "asharehub" and self.repository.initialized and not snapshot.get("quotes"):
             try:
                 cached_quotes = self.repository.get_latest_quotes(
@@ -930,6 +1376,41 @@ class ApplicationRuntime:
                 cached_quotes = []
             if not cached_quotes:
                 provider_issues.append("no_quote_data")
+        # A timestamp from the future is always an integrity failure: it can
+        # indicate a clock/unit conversion bug or an upstream replay that is
+        # not yet observable.  This remains actionable outside trading hours
+        # too, unlike stale/missing quotes where the prior close is expected
+        # while the exchange is closed.
+        if self.provider.name in {"asharehub", "alltick", "akshare"} and future_count:
+            provider_issues.append("quote_timestamp_future")
+        # During an active A-share session stale/missing quotes are actionable
+        # feed failures.  Outside trading hours the last close is expected and
+        # must not make the process appear unhealthy.
+        provider_market_status = getattr(self.provider, "current_market_status", None)
+        market = (
+            provider_market_status()
+            if callable(provider_market_status)
+            else market_status(now)
+        )
+        # Keep the data-readiness decision in the cache-only runtime status so
+        # health probes, Prometheus scrapers and the dashboard share the same
+        # semantics.  A running process is not necessarily serving usable
+        # market data: during an open session every configured symbol must be
+        # represented by a fresh quote, while outside trading hours a cached
+        # prior close is a valid observation (future timestamps remain invalid
+        # in either case).
+        configured_count = len(monitored_symbols)
+        data_readiness = build_data_readiness(
+            configured_symbols=configured_count,
+            received_symbols=received_count,
+            freshness_state=freshness_state,
+            market_is_trading=bool(market.get("is_trading")),
+        )
+        if self.provider.name in {"asharehub", "alltick", "akshare"} and market.get("is_trading"):
+            if stale_count:
+                provider_issues.append("quote_data_stale")
+            if missing_count:
+                provider_issues.append("quote_data_missing")
         if self.provider.name == "asharehub":
             remaining_soft = int(
                 provider_status.get("quota", {}).get("remaining_soft") or 0
@@ -942,6 +1423,7 @@ class ApplicationRuntime:
                 provider_issues.append("upstream_quota_exhausted")
         provider_issues = list(dict.fromkeys(provider_issues))
         degraded = bool(provider_issues)
+        database_state = "connected" if self.repository.initialized else "disconnected"
         history_required = (
             self.provider.name == "asharehub"
             and bool(self.monitor.cohort_strategies or self.monitor.strategies)
@@ -954,31 +1436,86 @@ class ApplicationRuntime:
                 self.settings.bank_strategy_min_universe,
             )
         )
-        serving_ready = self._startup_completed_at is not None
+        if not history_required:
+            research_ready_reason = "not_required"
+        elif research_ready:
+            research_ready_reason = "minimum_history_coverage_met"
+        elif self._history_bootstrap_deferred:
+            research_ready_reason = "history_bootstrap_deferred_for_budget"
+        elif self._history_bootstrap_failed:
+            research_ready_reason = "history_bootstrap_partial_failure"
+        elif self._history_bootstrap_state in {"running", "pending", "scheduled"}:
+            research_ready_reason = "history_bootstrap_in_progress"
+        else:
+            research_ready_reason = "history_bootstrap_not_ready"
+        serving_ready = (
+            self._startup_completed_at is not None
+            and self._startup_phase == "ready"
+            and running
+            and self.repository.initialized
+        )
         if running and degraded:
             provider_status["state"] = "degraded"
         elif error:
+            provider_status["state"] = "error"
+        lifecycle_status = {
+            "failed": "error",
+            "stopping": "stopping",
+            "stopped": "stopped",
+        }.get(self._startup_phase)
+        if lifecycle_status is not None:
+            provider_status["state"] = lifecycle_status
+        elif self._startup_phase == "ready" and not running:
             provider_status["state"] = "error"
         provider_status["issues"] = provider_issues
         return {
             "app": self.settings.app_name,
             "version": "0.1.0",
-            "status": "degraded" if degraded else ("ok" if running else "starting"),
-            "healthy": running and not degraded,
+            "status": lifecycle_status or (
+                "degraded" if degraded else ("ok" if running else "starting")
+            ),
+            "healthy": running and not degraded and lifecycle_status is None,
             "provider": provider_status,
-            "database": {"type": "sqlite", "state": "connected"},
+            "data_readiness": data_readiness,
+            "calendar_readiness": calendar_readiness,
+            "database": {"type": "sqlite", "state": database_state},
             "collector": {
                 "running": running,
                 "iteration": snapshot.get("iteration", 0),
                 "last_run": jsonable(last),
                 "last_duration_ms": snapshot.get("last_collection_duration_ms"),
-                "last_error": error,
+                # Keep the public contract useful for operators without
+                # reflecting provider exception text (which may contain a
+                # request URL, response body, or credential).
+                "last_error": (
+                    "collection failed ({})".format(public_error_type)
+                    if public_error_type
+                    else None
+                ),
+                "last_error_type": public_error_type,
+                "cycle_stats": snapshot.get(
+                    "cycle_stats",
+                    {
+                        "total": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "partial": 0,
+                        "cancelled": 0,
+                        "last_outcome": None,
+                    },
+                ),
+                "jobs": snapshot.get("jobs", {"active": 0, "recent": []}),
             },
             "startup": {
                 "ready": serving_ready,
                 "serving_ready": serving_ready,
                 "research_ready": research_ready,
+                "research_ready_reason": research_ready_reason,
+                "phase": self._startup_phase,
+                "started_at": jsonable(self._startup_started_at),
                 "ready_at": jsonable(self._startup_completed_at),
+                "duration_ms": self._startup_duration_ms,
+                "error_type": self._startup_error_type,
                 "collection_mode": "background",
                 "history_bootstrap": {
                     "state": self._history_bootstrap_state,
@@ -1011,7 +1548,7 @@ class ApplicationRuntime:
                 "symbols": len(self.symbols),
             },
             "websocket_clients": self.hub.count,
-            "market": market_status(now),
+            "market": market,
             "settings": self.settings.public_dict(),
             "server_time": now.isoformat(),
         }

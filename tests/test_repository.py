@@ -120,6 +120,18 @@ def test_sqlite_round_trip_and_wal_mode_use_tmp_database(tmp_path):
         assert stored_signal.action == SignalAction.BUY
         assert stored_signal.price == Decimal("1499.87")
         assert stored_signal.metadata == {"version": 1}
+        assert repository.signal_exists(
+            strategy=signal.strategy,
+            symbol=signal.symbol,
+            action=signal.action,
+            timestamp=signal.timestamp,
+        ) is True
+        assert repository.signal_exists(
+            strategy=signal.strategy,
+            symbol=signal.symbol,
+            action=signal.action,
+            timestamp=signal.timestamp + timedelta(seconds=1),
+        ) is False
 
         # The composite keys make collector retries idempotent.
         assert repository.upsert_quotes([quote]) == 1
@@ -129,11 +141,11 @@ def test_sqlite_round_trip_and_wal_mode_use_tmp_database(tmp_path):
 
         with sqlite3.connect(str(database_path)) as inspection:
             assert inspection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-            assert inspection.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert inspection.execute("PRAGMA user_version").fetchone()[0] == SQLiteRepository.SCHEMA_VERSION
             migrations = inspection.execute(
                 "SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version"
             ).fetchall()
-            assert [row[0] for row in migrations] == [1, 2, 3]
+            assert [row[0] for row in migrations] == list(range(1, SQLiteRepository.SCHEMA_VERSION + 1))
     finally:
         repository.close()
 

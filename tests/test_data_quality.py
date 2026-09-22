@@ -1,12 +1,13 @@
 import json
 from dataclasses import FrozenInstanceError
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
 
 from quant_monitor.domain import Bar, SHANGHAI_TZ
 from quant_monitor.services import DailyBarDataQualityService
+from quant_monitor.trading_calendar import VersionedSessionCalendar
 
 
 def bar(symbol, day, *, hour=15, minute=0, source="fixture"):
@@ -138,6 +139,31 @@ def test_duplicate_out_of_order_and_gap_are_reported_after_normalization():
     assert summary.status == "degraded"
 
 
+def test_missing_streaks_follow_calendar_sessions_and_expose_coverage():
+    calendar = VersionedSessionCalendar(
+        (
+            datetime(2026, 1, 5).date(),
+            datetime(2026, 1, 7).date(),
+            datetime(2026, 1, 8).date(),
+        ),
+        source="fixture",
+        version="calendar-v1",
+    )
+    summary = DailyBarDataQualityService(3, calendar=calendar).audit(
+        [bar("600000.SH", "2026-01-05"), bar("600000.SH", "2026-01-08")],
+        expected_symbols=("600000.SH",),
+        as_of=datetime(2026, 1, 8, 16, tzinfo=SHANGHAI_TZ),
+    )
+
+    item = summary.symbols[0]
+    assert item.missing_dates == ("2026-01-07",)
+    assert item.max_missing_streak == 1
+    assert item.missing_session_ranges == ("2026-01-07..2026-01-07",)
+    assert summary.max_missing_streak == 1
+    assert summary.calendar_coverage_start == "2026-01-05"
+    assert summary.calendar_coverage_end == "2026-01-08"
+
+
 def test_expected_latest_date_honors_publication_window_and_weekend():
     service = DailyBarDataQualityService(1)
     before_close = service.audit(
@@ -207,6 +233,27 @@ def test_off_calendar_daily_bar_is_reported_excluded_and_degrades_result():
     assert item.off_calendar_dates == ("2026-01-11",)
     assert item.future_dates == ("2026-01-11",)
     assert item.to_dict()["off_calendar_dates"] == ["2026-01-11"]
+
+
+def test_finite_calendar_out_of_coverage_is_reported_without_silent_holiday_inference():
+    calendar = VersionedSessionCalendar(
+        (date(2026, 1, 5), date(2026, 1, 6)),
+        source="fixture",
+        version="v1",
+    )
+    summary = DailyBarDataQualityService(2, calendar=calendar).audit(
+        [
+            bar("600000.SH", "2026-01-05"),
+            bar("600000.SH", "2026-01-06"),
+            bar("600000.SH", "2026-01-08"),
+        ],
+        expected_symbols=("600000.SH",),
+        as_of=datetime(2026, 1, 6, 16, tzinfo=SHANGHAI_TZ),
+    )
+    item = summary.symbols[0]
+    assert item.status == "warning"
+    assert item.calendar_out_of_coverage_dates == ("2026-01-08",)
+    assert item.to_dict()["calendar_out_of_coverage_date_count"] == 1
 
 
 def test_summary_is_immutable_and_json_native():

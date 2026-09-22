@@ -9,7 +9,7 @@ import re
 import uvicorn
 from uvicorn.logging import AccessFormatter, DefaultFormatter
 
-from quant_monitor.main import _build_uvicorn_log_config
+from quant_monitor.main import SafeAccessFormatter, _build_uvicorn_log_config
 
 
 def test_uvicorn_log_config_adds_timestamps_without_mutating_global_defaults():
@@ -50,3 +50,21 @@ def test_uvicorn_error_and_access_formatters_render_timestamps():
     assert prefix.search(rendered)
     assert "GET /health HTTP/1.1" in rendered
     assert "200 OK" in rendered
+
+
+def test_access_formatter_strips_query_strings_before_logging():
+    configured = _build_uvicorn_log_config()["formatters"]["access"]
+    access = SafeAccessFormatter(fmt=configured["fmt"], use_colors=False)
+    secret = "token=must-not-be-logged"
+    access_record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1:1234", "GET", "/api/v1/quotes?" + secret, "1.1", 200),
+        None,
+    )
+    rendered = access.format(access_record)
+    assert "GET /api/v1/quotes HTTP/1.1" in rendered
+    assert secret not in rendered

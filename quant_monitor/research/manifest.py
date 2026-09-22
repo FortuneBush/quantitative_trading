@@ -206,6 +206,15 @@ def _security_scan_text(value: str) -> str:
     """
 
     normalized = unicodedata.normalize("NFKC", value)
+    # Most result artifacts are large ASCII JSON strings.  Avoid constructing
+    # a second string for the common case where normalization did not change
+    # anything and no format separators can be present.  The previous
+    # unconditional join doubled peak memory for every security check and
+    # could raise MemoryError while reading a valid large result artifact.
+    if normalized.isascii():
+        return normalized
+    if not any(unicodedata.category(character) == "Cf" for character in normalized):
+        return normalized
     return "".join(
         character
         for character in normalized
@@ -362,6 +371,35 @@ def _validate_embedded_json(value: str, path: str) -> None:
             _validate_text(item, item_path, inspect_json=False)
 
     scan(parsed, path)
+
+
+def _validate_json_security(value: Any, path: str) -> None:
+    """Scan an already parsed JSON tree without allocating a frozen copy."""
+
+    if isinstance(value, Mapping):
+        try:
+            snapshot = list(value.items())
+        except Exception:
+            raise CanonicalizationError(
+                "unable to inspect embedded JSON at {}".format(path)
+            ) from None
+        for index, pair in enumerate(snapshot):
+            try:
+                key, nested = pair
+            except (TypeError, ValueError):
+                raise CanonicalizationError(
+                    "invalid embedded JSON object at {}".format(path)
+                ) from None
+            if isinstance(key, str) and _is_sensitive_field_name(key):
+                raise SensitiveManifestValueError(
+                    "credential-bearing JSON fields are not permitted at {}".format(path)
+                )
+            _validate_json_security(nested, "{}.<item#{}>".format(path, index))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _validate_json_security(nested, "{}[{}]".format(path, index))
+    elif isinstance(value, str):
+        _validate_text(value, path, inspect_json=True)
 
 
 def _validate_text(value: str, path: str, *, inspect_json: bool = True) -> str:
@@ -696,6 +734,21 @@ def hash_input_records(records: Iterable[Any]) -> str:
     return _digest_json_text(_dump_canonical(envelope))
 
 
+def verify_input_hash(input_hash: str, records: Iterable[Any]) -> None:
+    """Verify a persisted manifest input hash against normalized records.
+
+    This small fail-closed helper is intentionally pure so API callers and
+    offline tooling can use the exact same comparison.  It does not coerce a
+    supplied digest or echo either value in its exception message.
+    """
+
+    if type(input_hash) is not str or not _HASH_RE.fullmatch(input_hash):
+        raise ManifestValidationError("input_hash must use the sha256:<64 lowercase hex> form")
+    actual = hash_input_records(records)
+    if actual != input_hash:
+        raise ManifestValidationError("input records do not match manifest input_hash")
+
+
 def _freeze_semantic(value: Any, path: str, active: MutableSet[int]) -> Any:
     if isinstance(value, Enum):
         return _FrozenEnumValue(
@@ -943,3 +996,267 @@ class ResearchRunManifest:
         """Return the complete manifest as canonical JSON."""
 
         return _dump_canonical(self.to_dict())
+
+
+@dataclass(frozen=True)
+class ResearchRunRecord:
+    """Safe, immutable storage projection of a :class:`ResearchRunManifest`.
+
+    The record intentionally keeps the canonical JSON alongside a separate
+    digest of that JSON.  The content hash identifies the research inputs and
+    rules (and therefore may be shared by repeated runs); ``manifest_json_hash``
+    detects accidental or hostile mutation of the serialized payload at rest.
+    No credentials or machine-local paths can enter this projection because a
+    ``ResearchRunManifest`` rejects them before serialization.
+    """
+
+    run_id: str
+    content_hash: str
+    manifest_json: str
+    manifest_json_hash: str
+    manifest_schema_version: str
+    strategy_name: str
+    strategy_code_version: str
+    dataset_name: str
+    dataset_source: str
+    input_hash: str
+    calendar_version: str
+    universe_version: str
+    adjustment_version: str
+    constraint_version: str
+    created_at: datetime
+
+    @classmethod
+    def from_manifest(
+        cls, manifest: ResearchRunManifest, *, created_at: datetime
+    ) -> "ResearchRunRecord":
+        if not isinstance(manifest, ResearchRunManifest):
+            raise TypeError("manifest must be a ResearchRunManifest")
+        serialized = manifest.to_json()
+        return cls(
+            run_id=manifest.run_id,
+            content_hash=manifest.content_hash,
+            manifest_json=serialized,
+            manifest_json_hash=_digest_json_text(serialized),
+            manifest_schema_version=manifest.manifest_schema_version,
+            strategy_name=manifest.strategy_name,
+            strategy_code_version=manifest.strategy_code_version,
+            dataset_name=manifest.dataset.name,
+            dataset_source=manifest.dataset.source,
+            input_hash=manifest.input_hash,
+            calendar_version=manifest.calendar_version,
+            universe_version=manifest.universe_version,
+            adjustment_version=manifest.adjustment_version,
+            constraint_version=manifest.constraint_version,
+            created_at=created_at,
+        )
+
+    def __post_init__(self) -> None:
+        for name in (
+            "run_id",
+            "manifest_schema_version",
+            "strategy_name",
+            "strategy_code_version",
+            "dataset_name",
+            "dataset_source",
+            "calendar_version",
+            "universe_version",
+            "adjustment_version",
+            "constraint_version",
+        ):
+            object.__setattr__(
+                self, name, _identifier(getattr(self, name), "$.{}".format(name))
+            )
+        for name in ("content_hash", "manifest_json_hash", "input_hash"):
+            value = getattr(self, name)
+            if type(value) is not str or not _HASH_RE.fullmatch(value):
+                raise ManifestValidationError(
+                    "{} must use the sha256:<64 lowercase hex> form".format(name)
+                )
+        if type(self.manifest_json) is not str or not self.manifest_json:
+            raise ManifestValidationError("manifest_json cannot be empty")
+        _validate_text(self.manifest_json, "$.manifest_json")
+        try:
+            parsed = json.loads(self.manifest_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ManifestValidationError("manifest_json must be valid JSON") from None
+        if not isinstance(parsed, Mapping):
+            raise ManifestValidationError("manifest_json must contain an object")
+        # Persisted manifests are an interchange artifact, not merely a
+        # semantic JSON object.  Require the exact canonical bytes emitted by
+        # ``ResearchRunManifest.to_json()`` so two byte-different encodings
+        # cannot share a content hash while producing ambiguous exports or
+        # signatures during offline replay.
+        if _dump_canonical(parsed) != self.manifest_json:
+            raise ManifestValidationError(
+                "manifest_json must use canonical JSON serialization"
+            )
+        if parsed.get("run_id") != self.run_id:
+            raise ManifestValidationError("manifest_json run_id does not match record")
+        if parsed.get("content_hash") != self.content_hash:
+            raise ManifestValidationError("manifest_json content_hash does not match record")
+        expected_manifest_fields = {
+            "manifest_schema_version",
+            "purpose",
+            "strategy",
+            "dataset",
+            "input_hash",
+            "versions",
+            "configuration",
+            "assumptions",
+            "run_id",
+            "content_hash",
+        }
+        if set(parsed) != expected_manifest_fields:
+            raise ManifestValidationError("manifest_json fields do not match manifest schema")
+        if parsed.get("purpose") != "research_only":
+            raise ManifestValidationError("manifest_json purpose is not research_only")
+        strategy = parsed.get("strategy")
+        dataset = parsed.get("dataset")
+        versions = parsed.get("versions")
+        if (
+            not isinstance(strategy, Mapping)
+            or not isinstance(dataset, Mapping)
+            or not isinstance(versions, Mapping)
+        ):
+            raise ManifestValidationError("manifest_json is missing required sections")
+        expected_fields = {
+            "strategy_name": strategy.get("name"),
+            "strategy_code_version": strategy.get("code_version"),
+            "dataset_name": dataset.get("name"),
+            "dataset_source": dataset.get("source"),
+            "input_hash": parsed.get("input_hash"),
+            "calendar_version": versions.get("calendar"),
+            "universe_version": versions.get("universe"),
+            "adjustment_version": versions.get("adjustment"),
+            "constraint_version": versions.get("constraints"),
+        }
+        for field_name, expected in expected_fields.items():
+            if expected != getattr(self, field_name):
+                raise ManifestValidationError(
+                    "manifest_json {} does not match record".format(field_name)
+                )
+        if parsed.get("manifest_schema_version") != self.manifest_schema_version:
+            raise ManifestValidationError(
+                "manifest_json manifest_schema_version does not match record"
+            )
+        # Check the persisted serialization digest first so corruption of the
+        # stored bytes is reported distinctly from a semantically rehashed
+        # payload whose content hash no longer matches the manifest record.
+        if _digest_json_text(self.manifest_json) != self.manifest_json_hash:
+            raise ManifestValidationError("manifest_json hash does not match record")
+        unsigned_manifest = dict(parsed)
+        unsigned_manifest.pop("run_id", None)
+        unsigned_manifest.pop("content_hash", None)
+        if (
+            hash_canonical(
+                unsigned_manifest,
+                namespace="research-run-manifest-content-v2",
+            )
+            != self.content_hash
+        ):
+            raise ManifestValidationError(
+                "manifest_json content_hash does not match content"
+            )
+        object.__setattr__(self, "created_at", ensure_market_time(self.created_at))
+
+
+@dataclass(frozen=True)
+class ResearchResultRecord:
+    """Immutable, tamper-evident projection of a serialized backtest result."""
+
+    run_id: str
+    result_hash: str
+    result_json: str
+    result_json_hash: str
+    created_at: datetime
+
+    @classmethod
+    def from_json(
+        cls,
+        run_id: str,
+        result_json: str,
+        *,
+        created_at: datetime,
+    ) -> "ResearchResultRecord":
+        if type(result_json) is not str or not result_json:
+            raise ManifestValidationError("result_json cannot be empty")
+        try:
+            parsed = json.loads(result_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ManifestValidationError("result_json must be valid JSON") from None
+        if not isinstance(parsed, Mapping):
+            raise ManifestValidationError("result_json must contain an object")
+        # Result artifacts are copied byte-for-byte into downloads/exports.
+        # Keep an explicit security gate before hash validation so callers
+        # cannot mistake a valid integrity digest for a credential-safety
+        # attestation.
+        _validate_json_security(parsed, "$.result_json")
+        # Results are archived and downloaded byte-for-byte.  Reject
+        # semantically equivalent pretty-printed/unsorted encodings so the
+        # stored JSON hash and the canonical result hash describe one unique
+        # artifact rather than several interchangeable representations.
+        if _dump_canonical(parsed) != result_json:
+            raise ManifestValidationError(
+                "result_json must use canonical JSON serialization"
+            )
+        result_hash = parsed.get("result_hash")
+        if type(result_hash) is not str or not _HASH_RE.fullmatch(result_hash):
+            raise ManifestValidationError("result_json result_hash is invalid")
+        unsigned = dict(parsed)
+        unsigned.pop("result_hash", None)
+        if hash_canonical(unsigned, namespace="backtest-result-v1") != result_hash:
+            raise ManifestValidationError("result_json result_hash does not match content")
+        return cls(
+            run_id=run_id,
+            result_hash=result_hash,
+            result_json=result_json,
+            result_json_hash=_digest_json_text(result_json),
+            created_at=created_at,
+        )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run_id", _identifier(self.run_id, "$.run_id"))
+        for name in ("result_hash", "result_json_hash"):
+            value = getattr(self, name)
+            if type(value) is not str or not _HASH_RE.fullmatch(value):
+                raise ManifestValidationError(
+                    "{} must use the sha256:<64 lowercase hex> form".format(name)
+                )
+        if type(self.result_json) is not str or not self.result_json:
+            raise ManifestValidationError("result_json cannot be empty")
+        _validate_text(self.result_json, "$.result_json")
+        try:
+            parsed = json.loads(self.result_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ManifestValidationError("result_json must be valid JSON") from None
+        if not isinstance(parsed, Mapping) or parsed.get("result_hash") != self.result_hash:
+            raise ManifestValidationError("result_json result_hash does not match record")
+        if _dump_canonical(parsed) != self.result_json:
+            raise ManifestValidationError(
+                "result_json must use canonical JSON serialization"
+            )
+        unsigned = dict(parsed)
+        unsigned.pop("result_hash", None)
+        if hash_canonical(unsigned, namespace="backtest-result-v1") != self.result_hash:
+            raise ManifestValidationError("result_json result_hash does not match content")
+        if _digest_json_text(self.result_json) != self.result_json_hash:
+            raise ManifestValidationError("result_json hash does not match record")
+        object.__setattr__(self, "created_at", ensure_market_time(self.created_at))
+
+
+__all__ = [
+    "CANONICALIZATION_VERSION",
+    "MANIFEST_SCHEMA_VERSION",
+    "CanonicalizationError",
+    "DatasetDescriptor",
+    "ManifestValidationError",
+    "ResearchRunManifest",
+    "ResearchRunRecord",
+    "ResearchResultRecord",
+    "SensitiveManifestValueError",
+    "canonical_json",
+    "hash_canonical",
+    "hash_input_records",
+    "verify_input_hash",
+]

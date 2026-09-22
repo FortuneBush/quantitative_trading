@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -25,6 +26,16 @@ class Settings:
     # direct Settings(data_provider="mock") construction ever inheriting the
     # AShareHub database. Explicit caller paths remain authoritative.
     database_path: str = ""
+    # Bound SQLite initialization so a stale lock cannot make ASGI startup
+    # appear to hang forever.  The runtime emits a phase heartbeat while it
+    # waits and raises a safe, actionable error when this deadline expires.
+    startup_database_timeout_seconds: float = 30.0
+    # Upper bound for declared HTTP request bodies.  This protects the local
+    # API from accidentally posting an unbounded JSON/backtest payload while
+    # keeping the limit high enough for normal research artifacts.  Requests
+    # without Content-Length (including chunked/multipart uploads) are left to
+    # the endpoint's own parser so this guard remains backwards compatible.
+    api_max_request_body_bytes: int = 8 * 1024 * 1024
     # AShareHub is the primary real feed. AllTick and AKShare remain available
     # as compatibility providers and mock remains the deterministic offline source.
     data_provider: str = "asharehub"
@@ -57,6 +68,16 @@ class Settings:
     asharehub_history_refresh_seconds: float = 900.0
     asharehub_budget_path: str = "data/asharehub_budget.json"
     asharehub_strict_symbols: bool = False
+    # AShareHub exposes an exchange calendar; keep a week-long local snapshot
+    # so holiday workdays do not trigger needless quote requests.
+    # Direct Settings(...) construction remains conservative/offline by
+    # default; the shipped config profile explicitly enables the documented
+    # AShareHub calendar.  This keeps embedded/tests callers from acquiring a
+    # second upstream request unexpectedly while preserving the production
+    # launcher behaviour.
+    asharehub_trade_calendar_enabled: bool = False
+    asharehub_trade_calendar_cache_seconds: float = 604800.0
+    asharehub_trade_calendar_path: str = "data/asharehub_trade_calendar.json"
     strategy_profile: str = "bank_daily_multifactor_v1"
     bank_strategy_min_history: int = 130
     bank_strategy_min_universe: int = 15
@@ -66,6 +87,9 @@ class Settings:
     bank_strategy_max_drawdown: float = 0.18
     bank_strategy_corporate_action_gap: float = 0.06
     bank_strategy_min_liquidity_percentile: float = 0.10
+    # Optional point-in-time fundamental overlay. Zero keeps the price-only
+    # model; incomplete or temporally invalid evidence still fails closed.
+    bank_strategy_fundamental_weight: float = 0.20
     # Secrets are accepted only through QUANT_MONITOR_ALLTICK_TOKEN.  repr=False
     # prevents accidental disclosure in diagnostics; public_dict also omits it.
     alltick_token: str = field(default="", repr=False, compare=False)
@@ -108,6 +132,12 @@ class Settings:
         if not database_path:
             database_path = DEFAULT_DATABASE_PATH.format(provider=provider_name)
         object.__setattr__(self, "database_path", database_path)
+        timeout_seconds = float(self.startup_database_timeout_seconds)
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("startup_database_timeout_seconds must be positive")
+        max_body_bytes = int(self.api_max_request_body_bytes)
+        if max_body_bytes < 64 * 1024 or max_body_bytes > 64 * 1024 * 1024:
+            raise ValueError("api_max_request_body_bytes must be between 65536 and 67108864")
         if float(self.poll_interval_seconds) <= 0:
             raise ValueError("poll_interval_seconds must be positive")
         if int(self.history_bar_count) <= 0:
@@ -146,6 +176,9 @@ class Settings:
         ):
             if not 0 < float(getattr(self, name)) < 1:
                 raise ValueError("{} must be between 0 and 1".format(name))
+        fundamental_weight = float(self.bank_strategy_fundamental_weight)
+        if not math.isfinite(fundamental_weight) or not 0.0 <= fundamental_weight < 1.0:
+            raise ValueError("bank_strategy_fundamental_weight must be between 0 and 1")
         if self.bank_strategy_exit_percentile >= self.bank_strategy_entry_percentile:
             raise ValueError("bank strategy exit percentile must be below entry percentile")
         if float(self.asharehub_request_timeout_seconds) <= 0:
@@ -156,6 +189,7 @@ class Settings:
             "asharehub_instruments_cache_seconds",
             "asharehub_retry_backoff_seconds",
             "asharehub_history_refresh_seconds",
+            "asharehub_trade_calendar_cache_seconds",
         ):
             if float(getattr(self, name)) < 0:
                 raise ValueError("{} cannot be negative".format(name))
@@ -171,6 +205,8 @@ class Settings:
             )
         if not str(self.asharehub_budget_path).strip():
             raise ValueError("asharehub_budget_path cannot be empty")
+        if not str(self.asharehub_trade_calendar_path).strip():
+            raise ValueError("asharehub_trade_calendar_path cannot be empty")
         base_url = str(self.asharehub_base_url).strip().lower()
         if not base_url.startswith("https://"):
             if not (
@@ -234,10 +270,13 @@ class Settings:
                 "max_drawdown": self.bank_strategy_max_drawdown,
                 "corporate_action_gap": self.bank_strategy_corporate_action_gap,
                 "min_liquidity_percentile": self.bank_strategy_min_liquidity_percentile,
+                "fundamental_weight": self.bank_strategy_fundamental_weight,
                 "price_basis": "raw_unadjusted",
                 "signal_only": True,
             },
             "market_timezone": self.market_timezone,
+            "startup_database_timeout_seconds": self.startup_database_timeout_seconds,
+            "api_max_request_body_bytes": self.api_max_request_body_bytes,
             "asharehub_request_timeout_seconds": self.asharehub_request_timeout_seconds,
             "asharehub_quote_cache_seconds": self.asharehub_quote_cache_seconds,
             "asharehub_bars_cache_seconds": self.asharehub_bars_cache_seconds,
@@ -245,6 +284,8 @@ class Settings:
             "asharehub_daily_soft_limit": self.asharehub_daily_soft_limit,
             "asharehub_history_reserve_requests": self.asharehub_history_reserve_requests,
             "asharehub_history_refresh_seconds": self.asharehub_history_refresh_seconds,
+            "asharehub_trade_calendar_enabled": self.asharehub_trade_calendar_enabled,
+            "asharehub_trade_calendar_cache_seconds": self.asharehub_trade_calendar_cache_seconds,
             "alltick_request_timeout_seconds": self.alltick_request_timeout_seconds,
             "alltick_http_min_interval_seconds": self.alltick_http_min_interval_seconds,
             "alltick_quote_cache_seconds": self.alltick_quote_cache_seconds,
@@ -264,6 +305,8 @@ class Settings:
 
 _COERCERS = {
     "port": int,
+    "startup_database_timeout_seconds": float,
+    "api_max_request_body_bytes": int,
     "poll_interval_seconds": float,
     "history_bar_count": int,
     "mock_seed": int,
@@ -276,6 +319,7 @@ _COERCERS = {
     "asharehub_daily_soft_limit": int,
     "asharehub_history_reserve_requests": int,
     "asharehub_history_refresh_seconds": float,
+    "asharehub_trade_calendar_cache_seconds": float,
     "bank_strategy_min_history": int,
     "bank_strategy_min_universe": int,
     "bank_strategy_entry_percentile": float,
@@ -284,6 +328,7 @@ _COERCERS = {
     "bank_strategy_max_drawdown": float,
     "bank_strategy_corporate_action_gap": float,
     "bank_strategy_min_liquidity_percentile": float,
+    "bank_strategy_fundamental_weight": float,
     "alltick_request_timeout_seconds": float,
     "alltick_http_min_interval_seconds": float,
     "alltick_quote_cache_seconds": float,
@@ -339,6 +384,8 @@ def _env_overrides(environ: Mapping[str, str]) -> Dict[str, Any]:
         if field_name == "akshare_use_spot_fallback":
             coercer = _as_bool
         if field_name == "asharehub_strict_symbols":
+            coercer = _as_bool
+        if field_name == "asharehub_trade_calendar_enabled":
             coercer = _as_bool
         if field_name in {
             "alltick_use_websocket",

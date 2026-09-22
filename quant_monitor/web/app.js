@@ -1,3 +1,39 @@
+// Pure, side-effect-free readiness normalization keeps the dashboard's
+// fail-closed research semantics testable without booting the DOM runtime.
+function quantMonitorAnalysisReadiness(quality, provenance) {
+  const q = quality && typeof quality === "object" ? quality : {};
+  const p = provenance && typeof provenance === "object" ? provenance : {};
+  const analysisReady = q.analysis_ready === true;
+  const decisionReady = q.decision_ready === true;
+  const failuresValid = Array.isArray(q.analysis_readiness_failures);
+  const failures = failuresValid ? q.analysis_readiness_failures : [];
+  const analysisUsable = analysisReady && failuresValid && failures.length === 0;
+  const calculationInput = String(p.calculation_input || "unknown");
+  const inputLabel = calculationInput === "immutable_observations" ? "计算输入：不可变记录"
+    : calculationInput === "legacy_bars_projection" ? "计算输入：兼容缓存投影" : "计算输入：来源未说明";
+  return { analysisReady, decisionReady, analysisUsable, researchReady: analysisUsable && decisionReady, failures, calculationInput, inputLabel };
+}
+
+// A green HTTP/provider status is not enough to establish that a market
+// snapshot is usable.  Keep a compact aggregate that the dashboard can show
+// next to the breadth/ranking panels, so an operator does not have to inspect
+// every row to discover that the entire view is stale or untimestamped.
+function quantMonitorFreshnessSummary(states) {
+  const rows = Array.isArray(states) ? states : [];
+  const problematic = rows.filter((state) => ["stale", "future_timestamp", "missing", "unknown"].includes(String(state)));
+  const counts = problematic.reduce((result, state) => {
+    const key = String(state);
+    result[key] = (result[key] || 0) + 1;
+    return result;
+  }, {});
+  return {
+    total: rows.length,
+    problemCount: problematic.length,
+    status: rows.length === 0 ? "empty" : problematic.length ? "warning" : "ok",
+    counts,
+  };
+}
+
 (() => {
   "use strict";
 
@@ -31,7 +67,15 @@
     configuredWatchlist: [],
     lastSystem: null,
     latestMarketTime: null,
+    chartProvenance: null,
     requestSerial: 0,
+    // A visibility/online event can fire while the initial refresh is still
+    // in flight.  Reusing the same promise prevents duplicate requests and,
+    // more importantly, avoids older responses overwriting a newer view.
+    refreshInFlight: null,
+    researchRuns: [],
+    researchSelected: new Set(),
+    collectionIdempotencyKey: null,
   };
 
   const el = (id) => document.getElementById(id);
@@ -52,14 +96,21 @@
     analysisStatus: el("analysis-status"),
     analysisVerdict: el("analysis-verdict-value"),
     analysisVerdictNote: el("analysis-verdict-note"),
+    analysisScoreLabel: el("analysis-score-label"),
     analysisScore: el("analysis-score-value"),
     analysisRisk: el("analysis-risk-value"),
     analysisRiskNote: el("analysis-risk-note"),
+    analysisQualityStatus: el("analysis-quality-status"),
+    analysisQualityCoverage: el("analysis-quality-coverage"),
+    analysisQualityAsOf: el("analysis-quality-asof"),
+    analysisEntryGate: el("analysis-entry-gate"),
     analysisMetrics: el("analysis-metrics"),
     analysisNote: el("analysis-note"),
     analysisEvidence: el("analysis-evidence"),
     analysisRisks: el("analysis-risks"),
     analysisInvalidations: el("analysis-invalidations"),
+    analysisFactorBreakdown: el("analysis-factor-breakdown"),
+    bankFundamentals: el("bank-fundamentals"),
     watchlistBody: el("watchlist-body"),
     watchlistCount: el("watchlist-count"),
     bankToolbar: el("bank-toolbar"),
@@ -79,6 +130,7 @@
     selectedSymbol: el("selected-symbol"),
     selectedPrice: el("selected-price"),
     selectedChange: el("selected-change"),
+    chartProvenance: el("chart-provenance"),
     apiStatus: el("api-status"),
     wsStatus: el("ws-status"),
     providerStatus: el("provider-status"),
@@ -99,9 +151,22 @@
     marketBadge: el("market-badge"),
     clock: el("clock"),
     refresh: el("refresh-all"),
+    collectNow: el("collect-now"),
+    researchRunsCount: el("research-runs-count"),
+    researchRunsNote: el("research-runs-note"),
+    researchRunsList: el("research-runs-list"),
+    researchCompare: el("research-compare"),
+    researchCompareResult: el("research-compare-result"),
+    researchReport: el("research-report"),
     settings: el("settings-dialog"),
     toastRegion: el("toast-region"),
   };
+
+  const reportViewer = window.ResearchReport && dom.researchReport
+    ? window.ResearchReport.createController({
+      fetcher: (url, options) => window.fetch(url, options),
+      onUpdate: (reportState) => window.ResearchReport.render(dom.researchReport, reportState),
+    }) : null;
 
   function firstDefined(object, keys, fallback = null) {
     if (!object || typeof object !== "object") return fallback;
@@ -113,6 +178,10 @@
 
   function finiteNumber(value) {
     if (value === "" || value === null || value === undefined) return null;
+    // JSON booleans/objects are not numeric market data.  Number(true) and
+    // Number([]) would otherwise silently become 1/0 and contaminate charts,
+    // breadth and indicator labels.
+    if (typeof value === "boolean" || (typeof value === "object" && !Array.isArray(value))) return null;
     const number = typeof value === "string" ? Number(value.replace(/,/g, "")) : Number(value);
     return Number.isFinite(number) ? number : null;
   }
@@ -205,6 +274,12 @@
     if (label) label.textContent = text;
   }
 
+  function setQualityChip(node, text, status = "neutral") {
+    if (!node) return;
+    node.className = `quality-chip ${status}`;
+    node.textContent = text;
+  }
+
   function showToast(message, type = "info") {
     if (!dom.toastRegion) return;
     const toast = document.createElement("div");
@@ -212,6 +287,37 @@
     toast.textContent = message;
     dom.toastRegion.append(toast);
     window.setTimeout(() => toast.remove(), 4200);
+  }
+
+  // Keep the server's stable error contract intact for the dashboard.  A bare
+  // `HTTP 503` loses the provider/quota reason and makes an operator retry
+  // blindly; this error remains text-only so vendor messages cannot become
+  // executable markup.
+  class ApiRequestError extends Error {
+    constructor(status, payload = null, retryAfter = null) {
+      const envelope = payload && typeof payload === "object" && payload.error && typeof payload.error === "object"
+        ? payload.error : {};
+      const code = typeof envelope.code === "string" ? envelope.code : "http_error";
+      const message = typeof envelope.message === "string" && envelope.message.trim()
+        ? envelope.message.trim().slice(0, 256) : `HTTP ${status}`;
+      super(`HTTP ${status}: ${message}`);
+      this.name = "ApiRequestError";
+      this.status = Number(status);
+      this.code = code;
+      this.detail = message;
+      this.requestId = typeof envelope.request_id === "string" ? envelope.request_id : null;
+      this.retryAfter = retryAfter;
+      this.details = envelope.details ?? null;
+    }
+  }
+
+  function requestErrorMessage(error, fallback = "请求失败，请稍后重试") {
+    if (!error) return fallback;
+    if (error.name === "AbortError") return "请求超时，请稍后重试";
+    const detail = error instanceof ApiRequestError && error.detail ? error.detail : "";
+    const retry = error instanceof ApiRequestError && error.retryAfter
+      ? `（建议 ${error.retryAfter} 秒后重试）` : "";
+    return `${detail || fallback}${retry}`.slice(0, 280);
   }
 
   async function fetchJSON(path, options = {}) {
@@ -225,8 +331,19 @@
         ...requestOptions,
         signal: controller.signal,
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const payload = await response.json();
+      let payload = null;
+      if (!response.ok) {
+        // Error envelopes are small and bounded by the server, but malformed
+        // or non-JSON upstream responses must not hide the HTTP status.
+        try { payload = await response.json(); } catch { payload = null; }
+        const rawRetryAfter = response.headers && typeof response.headers.get === "function"
+          ? response.headers.get("Retry-After") : null;
+        const retryAfter = rawRetryAfter !== null && /^\d{1,6}$/.test(String(rawRetryAfter).trim())
+          ? Number(rawRetryAfter) : null;
+        setPill(dom.apiStatus, "本地 API 返回错误", "bad");
+        throw new ApiRequestError(response.status, payload, retryAfter);
+      }
+      payload = await response.json();
       state.lastApiSuccess = new Date();
       setPill(dom.apiStatus, "本地 API 已连接", "ok");
       return payload;
@@ -236,6 +353,7 @@
   }
 
   function normalizeQuote(raw) {
+    const source = raw && typeof raw === "object" ? raw : {};
     const price = finiteNumber(firstDefined(raw, ["price", "last", "last_price", "close", "current"]));
     const preClose = finiteNumber(firstDefined(raw, ["pre_close", "prev_close", "previous_close", "yclose"]));
     let change = finiteNumber(firstDefined(raw, ["change", "chg", "price_change"]));
@@ -252,8 +370,90 @@
       amount: finiteNumber(firstDefined(raw, ["amount", "turnover", "turnover_amount", "value"])),
       volume: finiteNumber(firstDefined(raw, ["volume", "vol"])),
       updatedAt: firstDefined(raw, ["updated_at", "timestamp", "time", "datetime", "ts"]),
+      freshness: firstDefined(source, ["freshness", "freshness_state", "quote_freshness"], null),
+      stale: firstDefined(source, ["stale"], null),
       raw,
     };
+  }
+
+  // Keep freshness visible at the row level.  A successful HTTP response can
+  // still contain an old SQLite snapshot, so a green provider status alone is
+  // not sufficient evidence that an individual quote is current.
+  function quoteFreshness(quote) {
+    const explicit = String(firstDefined(quote, ["freshness"], "")).toLowerCase();
+    if (["fresh", "stale", "missing", "future_timestamp", "future"].includes(explicit)) {
+      return explicit === "future" ? "future_timestamp" : explicit;
+    }
+    if (firstDefined(quote, ["stale"], null) === true) return "stale";
+    const timestamp = toDate(firstDefined(quote, ["updatedAt", "updated_at", "timestamp"], null));
+    if (!timestamp) return "unknown";
+    const age = (Date.now() - timestamp.getTime()) / 1000;
+    if (age < -5) return "future_timestamp";
+    const configured = state.lastSystem?.provider?.quote_freshness;
+    const threshold = finiteNumber(firstDefined(configured, ["threshold_seconds"], null));
+    return threshold !== null && age > threshold ? "stale" : "fresh";
+  }
+
+  function renderQuoteFreshness(cell, quote) {
+    if (!cell) return;
+    const container = cell.querySelector(".quote-price-stack") || cell;
+    let node = container.querySelector(".quote-asof");
+    if (!node) {
+      node = document.createElement("small");
+      node.className = "quote-asof";
+      node.dataset.field = "freshness";
+      container.append(node);
+    }
+    const status = quoteFreshness(quote);
+    const labels = { fresh: "新鲜", stale: "过期", missing: "缺失", future_timestamp: "时间异常", unknown: "时间未知" };
+    node.className = `quote-asof ${status}`;
+    node.textContent = `${labels[status] || "时间未知"} · ${formatTime(quote.updatedAt, true)}`;
+    const timestamp = toDate(quote.updatedAt);
+    node.title = timestamp ? `行情时间 ${timestamp.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}` : "该行情没有可验证的时间戳";
+    cell.classList.toggle("quote-stale-cell", status === "stale" || status === "future_timestamp");
+  }
+
+  function freshnessNotice(items) {
+    const rows = Array.isArray(items) ? items : [];
+    const summary = quantMonitorFreshnessSummary(rows.map(quoteFreshness));
+    if (summary.status === "empty") return "行情新鲜度待核验：暂无可验证快照";
+    if (summary.status === "ok") return `行情新鲜度：${summary.total} 只均通过时间戳校验`;
+    const details = [
+      ["stale", "过期"],
+      ["missing", "时间缺失"],
+      ["future_timestamp", "时间异常"],
+      ["unknown", "时间未知"],
+    ].filter(([key]) => summary.counts[key]).map(([key, label]) => `${label} ${summary.counts[key]}`).join("、");
+    return `行情新鲜度待核验：${summary.problemCount}/${summary.total} 只${details ? `（${details}）` : ""}`;
+  }
+
+  function refreshMarketFreshnessSummary() {
+    const rows = state.bankMode ? state.bankItems : state.marketQuotes;
+    const states = rows.map(quoteFreshness);
+    const summary = quantMonitorFreshnessSummary(states);
+    const text = freshnessNotice(rows);
+    if (dom.marketSource) {
+      const current = String(dom.marketSource.textContent || "").trim();
+      setPill(dom.marketSource, current || "行情源", summary.status === "ok" ? "ok" : "warning");
+      dom.marketSource.title = summary.status === "ok"
+        ? `收到 ${summary.total} 条可验证的新鲜行情`
+        : summary.status === "empty" ? "尚未收到可用行情" : `收到 ${summary.total - summary.problemCount} 条可验证行情，其中 ${summary.problemCount} 条新鲜度需核验`;
+    }
+    if (dom.marketInsightsNote) {
+      const previous = String(dom.marketInsightsNote.textContent || "");
+      const marker = /行情新鲜度(?:待核验)?：[^·]+/u;
+      dom.marketInsightsNote.textContent = marker.test(previous) ? previous.replace(marker, text) : previous ? `${previous} · ${text}` : text;
+      dom.marketInsightsNote.dataset.freshness = summary.status;
+      dom.marketInsightsNote.setAttribute("aria-live", "polite");
+    }
+  }
+
+  function refreshQuoteFreshnessIndicators() {
+    if (!dom.watchlistBody) return;
+    state.watchlist.forEach((quote) => {
+      const row = dom.watchlistBody.querySelector(`tr[data-symbol="${CSS.escape(quote.symbol)}"]`);
+      if (row) renderQuoteFreshness(row.querySelector('[data-field="price-cell"]'), quote);
+    });
   }
 
   function unwrapBankItem(raw) {
@@ -276,6 +476,7 @@
       ...normalized,
       exchange: exchangeRaw === "SSE" ? "SH" : exchangeRaw === "SZSE" ? "SZ" : exchangeRaw,
       analysis: analysis && typeof analysis === "object" ? analysis : null,
+      fundamental_factors: firstDefined(source, ["fundamental_factors"], null),
       researchScore,
       researchAction: String(firstDefined(recommendation, ["action", "signal", "bias"], firstDefined(source, ["action", "research_action"], ""))).toLowerCase(),
       researchLabel: firstDefined(recommendation, ["label"], firstDefined(source, ["research_label"], null)),
@@ -361,7 +562,22 @@
     if (dom.marketTotal) dom.marketTotal.textContent = `已收到 ${receivedCount} / 配置 ${configuredCount}`;
     const source = firstDefined(object, ["source", "provider", "data_source"], "未配置");
     const sourceName = source && typeof source === "object" ? firstDefined(source, ["name", "source"], "未配置") : source;
-    setPill(dom.marketSource, sourceName ? String(sourceName) : "未配置", receivedCount > 0 ? "ok" : "warning");
+    // A non-empty response is not sufficient evidence that the market view is
+    // current. Preserve the provider name, but visibly downgrade the source
+    // badge whenever any row is stale, future-dated, missing a timestamp or
+    // otherwise unverifiable. This keeps a cached close from looking like a
+    // live feed while retaining the row-level freshness markers below.
+    const freshnessStates = rows.map(quoteFreshness);
+    const freshnessWarnings = freshnessStates.filter((value) => ["stale", "future_timestamp", "missing", "unknown"].includes(value));
+    const sourceStatus = receivedCount <= 0 || !rows.length ? "warning" : freshnessWarnings.length ? "warning" : "ok";
+    setPill(dom.marketSource, sourceName ? String(sourceName) : "未配置", sourceStatus);
+    if (dom.marketSource) {
+      dom.marketSource.title = receivedCount <= 0 || !rows.length
+        ? "尚未收到可用行情"
+        : freshnessWarnings.length
+          ? `收到 ${receivedCount} 条行情，其中 ${freshnessWarnings.length} 条新鲜度需核验`
+          : `收到 ${receivedCount} 条可验证的新鲜行情`;
+    }
     const universeScope = String(firstDefined(object, ["universe_scope"], "provider_catalogue"));
     const configuredScope = universeScope === "configured_symbols";
     if (dom.marketTitle) dom.marketTitle.textContent = state.bankMode ? "银行板块概览" : configuredScope ? "自选行情范围" : "沪 A 全市场";
@@ -371,9 +587,14 @@
       const scopeNote = state.bankMode ? "银行分类与排名来自服务端聚合缓存，本地筛选排序不消耗额度" : configuredScope ? "当前看板仅展示已配置自选标的，以节省每日 API 额度" : "当前数据源提供完整证券目录";
       const breadthNote = summary.priced === 0 ? " · 日线参考尚未加载，涨跌统计暂不可用" : "";
       const sessionNote = " · 非交易时段为上一交易日收盘快照";
+      const freshnessNote = freshnessNotice(rows);
+      if (dom.marketInsightsNote) {
+        dom.marketInsightsNote.dataset.freshness = quantMonitorFreshnessSummary(rows.map(quoteFreshness)).status;
+        dom.marketInsightsNote.dataset.freshnessText = freshnessNote;
+      }
       dom.marketInsightsNote.textContent = asOf
-        ? `行情时间 ${formatTime(asOf, true)}${unpricedNote} · ${scopeNote}${breadthNote}${sessionNote}`
-        : `${scopeNote}；尚未收到行情。${breadthNote}${sessionNote}`;
+        ? `行情时间 ${formatTime(asOf, true)}${unpricedNote} · ${scopeNote}${breadthNote}${sessionNote} · ${freshnessNote}`
+        : `${scopeNote}；尚未收到行情。${breadthNote}${sessionNote} · ${freshnessNote}`;
     }
     if (dom.marketBreadth) {
       const values = [
@@ -474,6 +695,7 @@
       risk: risk && typeof risk === "object" ? risk : {},
       recommendation: recommendation && typeof recommendation === "object" ? recommendation : {},
       dataQuality: firstDefined(data, ["data_quality", "quality"], {}),
+      dataProvenance: firstDefined(data, ["data_provenance", "provenance"], {}),
       factors: firstDefined(data, ["factors"], {}),
       rank: finiteNumber(firstDefined(data, ["rank"], null)),
       universe_size: finiteNumber(firstDefined(data, ["universe_size"], null)),
@@ -490,18 +712,49 @@
     return number.toFixed(2);
   }
 
+  function renderBankFundamentals(record, symbol) {
+    if (!dom.bankFundamentals) return;
+    dom.bankFundamentals.hidden = !state.bankMode;
+    if (state.bankMode && typeof globalThis.BankResearch !== "undefined") {
+      globalThis.BankResearch.renderFundamentals(dom.bankFundamentals, record, symbol);
+    } else dom.bankFundamentals.textContent = "";
+  }
+
   function renderAnalysis(payload) {
     const data = normalizeAnalysis(payload);
     state.analysis = data;
+    renderBankFundamentals(data.fundamental_factors, data.symbol);
     const marketName = state.marketQuotes.find((item) => item.symbol === data.symbol)?.name;
     if (dom.analysisName) dom.analysisName.textContent = (data.name && data.name !== data.symbol ? data.name : marketName) || data.symbol || "选择股票";
     if (dom.analysisSymbol) dom.analysisSymbol.textContent = data.symbol || "—";
     const quality = data.dataQuality && typeof data.dataQuality === "object" ? data.dataQuality : {};
-    const qualityStatus = String(firstDefined(quality, ["status"], "ok"));
-    const statusText = qualityStatus === "ok" ? "分析就绪" : qualityStatus === "stale" ? "数据偏旧" : qualityStatus === "partial" ? "缓存分析" : "数据不足";
-    setPill(dom.analysisStatus, statusText, qualityStatus === "ok" ? "ok" : qualityStatus === "stale" || qualityStatus === "partial" ? "warning" : "neutral");
+    const qualityStatus = String(firstDefined(quality, ["status"], "ok")).toLowerCase();
+    const provenance = data.dataProvenance && typeof data.dataProvenance === "object" ? data.dataProvenance : {};
+    const readiness = quantMonitorAnalysisReadiness(quality, provenance);
+    const calculationInput = readiness.calculationInput;
+    // Research readiness is deliberately fail-closed.  A complete indicator
+    // calculation is not the same as a decision-ready, immutable evidence
+    // set, and old payloads without these fields must never look healthy.
+    const { analysisReady, decisionReady, analysisUsable, researchReady, failures: readinessFailures, inputLabel } = readiness;
+    const hasReadinessFailures = readinessFailures.length > 0;
+    const statusText = !analysisUsable ? (qualityStatus === "stale" ? "数据偏旧 · 研究未就绪" : "研究条件未满足") : !decisionReady ? "研究结果可用 · 未认证" : qualityStatus === "ok" ? "分析就绪" : qualityStatus === "stale" ? "数据偏旧" : qualityStatus === "partial" ? "缓存分析" : "数据不足";
+    setPill(dom.analysisStatus, statusText, researchReady && qualityStatus === "ok" ? "ok" : qualityStatus === "stale" || qualityStatus === "partial" || !researchReady ? "warning" : "neutral");
+    const qualityLabels = { ok: "数据质量 良好", stale: "数据质量 偏旧", partial: "数据质量 部分", insufficient: "数据质量 不足", insufficient_data: "数据质量 不足" };
+    const qualityTone = researchReady && qualityStatus === "ok" ? "ok" : ["stale", "partial"].includes(qualityStatus) || !researchReady ? "warning" : "neutral";
+    setQualityChip(dom.analysisQualityStatus, !analysisUsable ? "研究证据 未就绪" : !decisionReady ? "研究数据可用 · 未认证" : (qualityLabels[qualityStatus] || `数据质量 ${qualityStatus}`), qualityTone);
+    if (dom.analysisQualityStatus) {
+      const missingIndicators = firstDefined(quality, ["missing_indicators"], []);
+      const qualityReasons = [];
+      if (quality.stale || qualityStatus === "stale") qualityReasons.push("日线或快照已超过新鲜度阈值");
+      if (Array.isArray(missingIndicators) && missingIndicators.length) qualityReasons.push(`缺少指标：${missingIndicators.slice(0, 4).join("、")}`);
+      if (hasReadinessFailures) qualityReasons.push(`研究条件：${readinessFailures.slice(0, 3).map(String).join("、")}`);
+      qualityReasons.push(inputLabel);
+      dom.analysisQualityStatus.title = qualityReasons.join("；") || "研究数据质量由服务端根据样本量、新鲜度和指标完整性判定";
+    }
     const recommendation = data.recommendation || {};
-    const action = String(firstDefined(recommendation, ["action"], ""));
+    const bankBreakdown = state.bankMode && typeof globalThis.BankResearch !== "undefined";
+    if (dom.analysisScoreLabel) dom.analysisScoreLabel.textContent = state.bankMode ? "同业综合分" : "趋势分数";
+    const action = analysisUsable ? String(firstDefined(recommendation, ["action"], "")) : "insufficient_data";
     const actionLabels = { buy: "偏强研究", sell: "偏弱研究", hold: "中性观察", positive_bias: "偏强研究", negative_bias: "偏弱研究", risk_caution: "风险观察", neutral: "中性观察", insufficient_data: "数据不足" };
     const research = researchPresentation(action, firstDefined(recommendation, ["label"], null));
     if (dom.analysisVerdict) {
@@ -510,10 +763,13 @@
     }
     if (dom.analysisVerdictNote) {
       const reason = firstDefined(recommendation, ["reason", "description"], "基于趋势、动量与风险指标");
-      dom.analysisVerdictNote.textContent = Array.isArray(reason) ? reason.filter(Boolean).slice(0, 2).join(" · ") : String(reason);
+      const reasonText = Array.isArray(reason) ? reason.filter(Boolean).slice(0, 2).join(" · ") : String(reason);
+      dom.analysisVerdictNote.textContent = !analysisUsable
+        ? `${inputLabel} · 研究条件未满足${hasReadinessFailures ? `：${readinessFailures.slice(0, 2).map(String).join("、")}` : ""}`
+        : `${inputLabel} · ${reasonText}${decisionReady ? "" : " · 来源认证未接入，仅供研究，不构成交易指令"}`;
     }
     const trendScore = finiteNumber(firstDefined(data.trend, ["score"], null));
-    if (dom.analysisScore) dom.analysisScore.textContent = trendScore === null ? "—" : `${trendScore > 0 ? "+" : ""}${(trendScore * 100).toFixed(0)}`;
+    if (dom.analysisScore) dom.analysisScore.textContent = trendScore === null ? "—" : state.bankMode ? (trendScore * 100).toFixed(1) : `${trendScore > 0 ? "+" : ""}${(trendScore * 100).toFixed(0)}`;
     const riskScore = finiteNumber(firstDefined(data.risk, ["score"], null));
     const riskLabels = { low: "低", medium: "中", high: "高", insufficient_data: "数据不足" };
     const riskLabel = analysisLabel(firstDefined(data.risk, ["label"], ""), riskLabels);
@@ -551,6 +807,20 @@
     }
     const barsUsed = firstDefined(quality, ["bars_used"], data.bars_used);
     const barsRequired = firstDefined(quality, ["bars_required"], null);
+    const coverageText = barsUsed !== null && barsUsed !== undefined
+      ? `样本 ${barsUsed}${barsRequired ? ` / ${barsRequired}` : ""} 根`
+      : "样本 —";
+    setQualityChip(dom.analysisQualityCoverage, coverageText, barsRequired && Number(barsUsed) < Number(barsRequired) ? "warning" : "neutral");
+    const barAsOf = firstDefined(quality, ["bar_as_of", "latest_bar_at"], null);
+    setQualityChip(dom.analysisQualityAsOf, barAsOf ? `日线截至 ${formatTime(barAsOf, true)}` : "日线截至 —", barAsOf ? "neutral" : "warning");
+    const entryEligible = firstDefined(recommendation, ["entry_eligible"], null);
+    const gateFailures = firstDefined(recommendation, ["gate_failures"], []);
+    const gateFailed = Array.isArray(gateFailures) && gateFailures.length > 0;
+    if (entryEligible === true && analysisUsable && decisionReady) setQualityChip(dom.analysisEntryGate, "入场门控 满足", "ok");
+    else if (entryEligible === true && analysisUsable) setQualityChip(dom.analysisEntryGate, "入场门控 计算通过 · 未认证", "warning");
+    else if (entryEligible === false || gateFailed) setQualityChip(dom.analysisEntryGate, gateFailed ? `入场门控 未通过 ${gateFailures.length}` : "入场门控 未满足", "warning");
+    else setQualityChip(dom.analysisEntryGate, "入场门控 —", "neutral");
+    if (dom.analysisEntryGate) dom.analysisEntryGate.title = gateFailed ? gateFailures.map(String).join("；") : "策略未提供可解释的入场门控结果";
     const evidence = firstDefined(recommendation, ["evidence", "reasons", "reason"], [
       firstDefined(data.trend, ["description"], "趋势证据暂不可用"),
       firstDefined(data.momentum, ["description"], "动量证据暂不可用"),
@@ -560,16 +830,22 @@
     renderDetailList(dom.analysisEvidence, evidence, "当前缓存未提供可复核的研究证据");
     renderDetailList(dom.analysisRisks, risks, "风险指标或历史样本不足");
     renderDetailList(dom.analysisInvalidations, invalidations, "缓存策略尚未提供明确失效条件，不应据此形成交易指令");
+    if (dom.analysisFactorBreakdown) {
+      if (bankBreakdown) globalThis.BankResearch.render(dom.analysisFactorBreakdown, data);
+      else dom.analysisFactorBreakdown.textContent = "";
+    }
     if (dom.analysisNote) {
       const qualityNote = barsUsed !== null && barsUsed !== undefined
-        ? `使用 ${barsUsed}${barsRequired ? ` / 至少 ${barsRequired}` : ""} 根 K 线 · 数据状态 ${qualityStatus} · 仅供研究观察，不构成投资建议。`
-        : "当前仅展示服务端已有缓存分析；不会自动逐股请求历史数据，不构成投资建议。";
+        ? `使用 ${barsUsed}${barsRequired ? ` / 至少 ${barsRequired}` : ""} 根 K 线 · 数据状态 ${qualityStatus} · ${inputLabel} · ${!analysisUsable ? "研究条件未满足，暂不形成方向性结论" : decisionReady ? "研究条件已满足" : "研究结果可用但来源未认证，仅供研究"} · 仅供研究观察，不构成投资建议。`
+        : `${inputLabel} · 当前仅展示服务端已有缓存分析；研究条件未满足，不构成投资建议。`;
       dom.analysisNote.textContent = qualityNote;
     }
   }
 
   function renderAnalysisUnavailable(bankItem = null) {
     const quote = bankItem || {};
+    renderBankFundamentals(quote.fundamental_factors, quote.symbol);
+    state.analysis = null;
     if (dom.analysisName) dom.analysisName.textContent = quote.name || "选择银行股";
     if (dom.analysisSymbol) dom.analysisSymbol.textContent = quote.symbol || "—";
     setPill(dom.analysisStatus, quote.symbol ? "缓存分析不足" : "等待选择", "neutral");
@@ -579,12 +855,18 @@
     }
     if (dom.analysisVerdictNote) dom.analysisVerdictNote.textContent = "板块页不会为每只银行自动请求日线";
     if (dom.analysisScore) dom.analysisScore.textContent = "—";
+    if (dom.analysisScoreLabel) dom.analysisScoreLabel.textContent = state.bankMode ? "同业综合分" : "趋势分数";
     if (dom.analysisRisk) {
       dom.analysisRisk.textContent = "—";
       dom.analysisRisk.className = "";
     }
     if (dom.analysisRiskNote) dom.analysisRiskNote.textContent = "等待完整历史样本";
+    setQualityChip(dom.analysisQualityStatus, "数据质量 不足", "neutral");
+    setQualityChip(dom.analysisQualityCoverage, "样本 —", "neutral");
+    setQualityChip(dom.analysisQualityAsOf, "日线截至 —", "warning");
+    setQualityChip(dom.analysisEntryGate, "入场门控 —", "neutral");
     if (dom.analysisMetrics) [...dom.analysisMetrics.querySelectorAll("strong")].forEach((node) => { node.textContent = "—"; });
+    if (dom.analysisFactorBreakdown) dom.analysisFactorBreakdown.textContent = "";
     renderDetailList(dom.analysisEvidence, null, "当前缓存没有足够的历史 K 线证据");
     renderDetailList(dom.analysisRisks, null, "数据不足本身就是风险，暂不形成方向性研究偏向");
     renderDetailList(dom.analysisInvalidations, null, "没有有效研究结论，因此没有可执行的失效条件");
@@ -672,6 +954,9 @@
     const quota = firstDefined(object, ["quota", "request_quota"], {});
     const total = finiteNumber(firstDefined(universe, ["total", "count"], firstDefined(coverage, ["configured", "total"], state.bankItems.length)));
     const received = finiteNumber(firstDefined(coverage, ["quotes_received", "received", "priced"], state.bankItems.filter((item) => item.price !== null).length));
+    const analysisReady = finiteNumber(firstDefined(coverage, ["analysis_ready"], null));
+    const qualityReady = finiteNumber(firstDefined(coverage, ["quality_ready"], null));
+    const decisionReady = finiteNumber(firstDefined(coverage, ["decision_ready"], null));
     const advancers = finiteNumber(firstDefined(summary, ["advancers", "advancing"], state.bankItems.filter((item) => item.changePct !== null && item.changePct > 0).length));
     const decliners = finiteNumber(firstDefined(summary, ["decliners", "declining"], state.bankItems.filter((item) => item.changePct !== null && item.changePct < 0).length));
     const median = finiteNumber(firstDefined(summary, ["median_pct_change", "median_change_pct"], null));
@@ -679,8 +964,14 @@
     const used = finiteNumber(firstDefined(quota, ["used", "requests_used", "consumed"], null));
     let remaining = finiteNumber(firstDefined(quota, ["remaining_soft", "remaining", "available"], null));
     if (remaining === null && limit !== null && used !== null) remaining = Math.max(0, limit - used);
+    const coverageSecondary = `缺失 ${Math.max(0, (total ?? 0) - (received ?? 0))} 只`;
+    const coverageEvidence = [
+      analysisReady === null ? null : `研究 ${analysisReady}`,
+      qualityReady === null ? null : `质量证据 ${qualityReady}`,
+      decisionReady === null ? null : `决策证据 ${decisionReady}`,
+    ].filter(Boolean).join(" / ");
     const cards = [
-      { name: "银行股覆盖", symbol: "COVERAGE", metric: `${received ?? 0} / ${total ?? state.bankItems.length}`, secondary: `缺失 ${Math.max(0, (total ?? 0) - (received ?? 0))} 只` },
+      { name: "银行股覆盖", symbol: "COVERAGE", metric: `${received ?? 0} / ${total ?? state.bankItems.length}`, secondary: coverageEvidence ? `${coverageSecondary}；${coverageEvidence}` : coverageSecondary },
       { name: "涨跌家数", symbol: "UP / DOWN", metric: `${advancers ?? 0} / ${decliners ?? 0}`, secondary: `上涨 / 下跌` },
       { name: "中位涨幅", symbol: "MEDIAN", metric: formatPercent(median), secondary: "较平均值更少受极端波动影响", change_pct: median },
       { name: "今日 API 额度", symbol: "LOCAL EST.", metric: remaining === null ? "—" : `${remaining} 次`, secondary: limit === null ? "本机估算" : `本机软预算 ${limit} 次` },
@@ -710,6 +1001,8 @@
         amount: item.amount,
         volume: item.volume,
         updated_at: item.updatedAt,
+        freshness: item.freshness,
+        stale: item.stale,
       })),
       total: finiteNumber(firstDefined(coverage, ["quotes_received", "received"], state.bankItems.length)) ?? state.bankItems.length,
       universe_total: finiteNumber(firstDefined(universe, ["total", "count"], firstDefined(coverage, ["configured", "total"], state.bankItems.length))) ?? state.bankItems.length,
@@ -767,9 +1060,15 @@
     const trading = firstDefined(raw, ["is_trading", "trading", "is_open"]);
     const phase = String(firstDefined(raw, ["phase", "status", "state"], "")).toLowerCase();
     const label = String(firstDefined(raw, ["label", "name"], trading ? "交易中" : "休市"));
-    state.marketStatus = { trading: trading === true, phase, label, receivedAt: Date.now() };
-    const status = trading === true ? "ok" : ["auction", "preopen", "call_auction", "集合竞价"].includes(phase) ? "warning" : "closed";
+    const calendarLookup = String(firstDefined(raw, ["calendar_lookup"], "")).toLowerCase();
+    const calendar = String(firstDefined(raw, ["calendar"], "")).toLowerCase();
+    const calendarUnknown = calendarLookup === "unknown" || calendar === "weekday_fallback" && calendarLookup !== "open" && calendarLookup !== "closed";
+    state.marketStatus = { trading: trading === true, phase, label, calendarLookup, calendar, receivedAt: Date.now() };
+    const status = calendarUnknown ? "warning" : trading === true ? "ok" : ["auction", "preopen", "call_auction", "集合竞价"].includes(phase) ? "warning" : "closed";
     setPill(dom.marketBadge, label, status);
+    if (dom.marketBadge) dom.marketBadge.title = calendarUnknown
+      ? "交易日历未覆盖当前日期，市场状态仅按工作日规则估计"
+      : "";
   }
 
   function renderWatchlist() {
@@ -826,6 +1125,13 @@
       price.className = "quote-price";
       price.dataset.field = "price";
       price.textContent = formatPrice(quote.price);
+      const priceCell = document.createElement("td");
+      priceCell.dataset.field = "price-cell";
+      const priceStack = document.createElement("div");
+      priceStack.className = "quote-price-stack";
+      priceStack.append(price);
+      priceCell.append(priceStack);
+      renderQuoteFreshness(priceCell, quote);
 
       const changeCell = document.createElement("td");
       const change = document.createElement("span");
@@ -844,7 +1150,7 @@
       researchTag.className = `research-tag ${research.className}`;
       researchTag.textContent = quote.analysis ? research.label : "待分析";
       researchCell.append(researchTag);
-      row.append(identity, price, changeCell, amount, researchCell);
+      row.append(identity, priceCell, changeCell, amount, researchCell);
       row.addEventListener("click", () => selectSymbol(quote.symbol));
       row.addEventListener("keydown", (event) => {
         if (event.key === "Enter" || event.key === " ") {
@@ -881,6 +1187,8 @@
           priceNode.classList.add(movement);
         }
       }
+      const priceCell = row.querySelector('[data-field="price-cell"]');
+      if (priceCell) renderQuoteFreshness(priceCell, state.watchlist[index]);
       if (changeNode && incoming.changePct !== null) {
         changeNode.className = `quote-change ${directionClass(incoming.changePct)}`;
         changeNode.textContent = formatPercent(incoming.changePct);
@@ -908,6 +1216,14 @@
   async function selectSymbol(symbol, force = false) {
     if (!symbol) return;
     if (!force && state.selectedSymbol === symbol && state.bars.length && state.analysis) return;
+    // Never carry the previous symbol's research conclusion while a new
+    // request is in flight.  A failed request must leave an explicit empty
+    // state rather than silently showing stale evidence for another stock.
+    if (state.selectedSymbol !== symbol) {
+      state.analysis = null;
+      state.bars = [];
+      state.chartProvenance = null;
+    }
     state.selectedSymbol = symbol;
     renderWatchlist();
     const quote = state.watchlist.find((item) => item.symbol === symbol)
@@ -939,6 +1255,39 @@
       ma5: finiteNumber(firstDefined(raw, ["ma5", "ma_5"])),
       ma20: finiteNumber(firstDefined(raw, ["ma20", "ma_20"])),
     };
+  }
+
+  // A successful bars response is not, by itself, proof that every rendered
+  // candle has immutable source/quality evidence. Keep that distinction
+  // visible next to the chart so cached legacy projections cannot be mistaken
+  // for a fully auditable history.
+  function renderChartProvenance(provenance, rows = state.bars) {
+    if (!dom.chartProvenance) return;
+    const data = provenance && typeof provenance === "object" ? provenance : {};
+    const served = finiteNumber(firstDefined(data, ["served_item_count", "count"], rows.length)) ?? rows.length;
+    const matched = finiteNumber(firstDefined(data, ["immutable_observation_count", "matched_count"], null));
+    const legacy = finiteNumber(firstDefined(data, ["legacy_item_count"], matched === null ? null : Math.max(0, served - matched)));
+    const last = rows.length ? rows[rows.length - 1].time : null;
+    const asOf = firstDefined(data, ["as_of", "latest_period_end", "updated_at"], last);
+    const dateText = asOf ? ` · 截至 ${formatTime(asOf, true)}` : "";
+    let tone = "neutral";
+    let text = "K 线来源 —";
+    if (!served) {
+      text = "K 线暂无数据";
+    } else if (data.authoritative === true && matched === served) {
+      tone = "ok";
+      text = `K 线可追溯 · ${served} 根${dateText}`;
+    } else if (matched !== null && matched > 0 && legacy !== null && legacy > 0) {
+      tone = "warning";
+      text = `K 线部分可追溯 · ${matched}/${served} 根${dateText}`;
+    } else {
+      tone = "warning";
+      text = `K 线缓存投影 · ${served} 根${dateText}`;
+    }
+    dom.chartProvenance.className = `chart-provenance ${tone}`;
+    dom.chartProvenance.textContent = text;
+    const warnings = Array.isArray(data.warnings) && data.warnings.length ? `；警告：${data.warnings.join("、")}` : "";
+    dom.chartProvenance.title = `${data.authoritative === true ? "已声明权威" : "兼容缓存投影，未声明权威"}${matched !== null ? `；不可变观测 ${matched}/${served}` : ""}${warnings}`;
   }
 
   function movingAverage(rows, size) {
@@ -976,6 +1325,7 @@
     dom.volumeChart.replaceChildren();
     dom.chartTooltip.hidden = true;
     const rows = state.bars.filter((bar) => bar.close !== null);
+    renderChartProvenance(state.chartProvenance, rows);
     if (rows.length < 2) {
       dom.chartEmpty.hidden = false;
       return;
@@ -1139,6 +1489,19 @@
     const description = document.createElement("p");
     description.textContent = String(firstDefined(raw, ["message", "description", "reason", "content"], "等待更多详情"));
     copy.append(title, description);
+    if (!isAlert) {
+      const assurance = raw && raw.research_assurance;
+      const bindingState = assurance && assurance.strategy_binding_status;
+      const bindingLabel = bindingState === "digest_consistent"
+        ? "策略摘要一致（非来源认证）"
+        : bindingState === "invalid" ? "策略绑定异常" : "策略绑定未记录";
+      const evidence = document.createElement("small");
+      evidence.className = "event-assurance";
+      // Missing/old server fields must not make historical BUY/SELL events
+      // appear certified.  The signal API has no bound input dataset yet.
+      evidence.textContent = `历史研究输出 · 输入血缘未绑定 · ${bindingLabel} · 非交易指令`;
+      copy.append(evidence);
+    }
 
     const time = document.createElement("time");
     time.className = "event-time";
@@ -1254,6 +1617,14 @@
   function renderSystem(payload) {
     const data = objectFrom(payload);
     state.lastSystem = data;
+    // The system endpoint carries the provider's freshness threshold.  Apply
+    // it to already-rendered rows so a later health poll can relabel cached
+    // quotes without fetching each detail endpoint again.
+    refreshQuoteFreshnessIndicators();
+    // The same threshold also changes the aggregate warning in the market
+    // panel; refresh it after health telemetry arrives so the note cannot
+    // remain falsely green from the earlier cache render.
+    refreshMarketFreshnessSummary();
     const healthyRaw = firstDefined(data, ["healthy", "ok", "status"], false);
     const statusRaw = firstDefined(data, ["status"], healthyRaw);
     const healthy = healthyRaw === true || ["ok", "healthy", "running", "up", "正常"].includes(String(healthyRaw).toLowerCase());
@@ -1339,10 +1710,17 @@
     const heartbeat = firstDefined(data, ["last_heartbeat", "updated_at", "timestamp", "server_time"], collector && typeof collector === "object" ? firstDefined(collector, ["last_run", "last_cycle", "updated_at"]) : null);
     const collectorError = collector && typeof collector === "object" ? firstDefined(collector, ["last_error", "error"]) : null;
     const providerIssues = provider && typeof provider === "object" ? firstDefined(provider, ["issues"], []) : [];
+    const quoteFreshness = provider && typeof provider === "object" ? firstDefined(provider, ["quote_freshness"], {}) : {};
+    const freshnessState = String(firstDefined(quoteFreshness, ["state"], "")).toLowerCase();
+    const freshnessReceived = finiteNumber(firstDefined(quoteFreshness, ["received_symbols"], null));
+    const freshnessConfigured = finiteNumber(firstDefined(quoteFreshness, ["configured_symbols"], null));
+    const freshnessSummary = freshnessReceived !== null && freshnessConfigured !== null
+      ? `行情 ${freshnessReceived}/${freshnessConfigured}${freshnessState && !["fresh", "untracked"].includes(freshnessState) ? ` · ${({ stale: "过期", partial: "部分", missing: "缺失", future_timestamp: "时间异常" }[freshnessState] || freshnessState)}` : ""}`
+      : "";
     if (healthy) {
       const cacheNote = cacheHit === true || cacheState === "hit" ? " · 本次命中本地缓存" : "";
       const capabilityNote = isAShareHub && !hasOrderBook ? " · 无五档盘口" : "";
-      dom.heartbeatText.textContent = `最近心跳 ${formatTime(heartbeat || Date.now())}${lastProviderSuccess ? ` · 上游更新 ${formatTime(lastProviderSuccess, true)}` : ""}${cacheNote}${capabilityNote}`;
+      dom.heartbeatText.textContent = `最近心跳 ${formatTime(heartbeat || Date.now())}${lastProviderSuccess ? ` · 上游更新 ${formatTime(lastProviderSuccess, true)}` : ""}${freshnessSummary ? ` · ${freshnessSummary}` : ""}${cacheNote}${capabilityNote}`;
     } else if (collectorError) {
       dom.heartbeatText.textContent = `采集异常：${String(collectorError).slice(0, 140)}`;
     } else if (Array.isArray(providerIssues) && providerIssues.length) {
@@ -1355,6 +1733,9 @@
         rate_limited: "供应商已限制请求频率",
         authentication_failed: "API Key 认证失败",
         no_quote_data: "尚未收到可用行情快照",
+        quote_data_missing: "部分行情快照缺失",
+        quote_data_stale: "行情快照已过期",
+        quote_timestamp_future: "行情时间戳异常",
         order_book_unavailable: "五档盘口暂不可用",
         daily_reference_unavailable: "日 K 参考数据暂不可用",
         static_info_unavailable: "证券基础信息暂不可用",
@@ -1429,7 +1810,13 @@
     const asOf = firstDefined(object, ["as_of", "updated_at"], firstDefined(universe, ["as_of", "updated_at"], firstDefined(coverage, ["as_of", "updated_at"], null)));
     const notice = String(firstDefined(object, ["notice"], "银行分类、排名与量化摘要来自服务端缓存"));
     if (dom.marketInsightsNote) {
-      dom.marketInsightsNote.textContent = `${asOf ? `数据时间 ${formatTime(asOf, true)} · ` : ""}${notice}${remaining !== null ? ` · 本机估算额度 ${remaining}/${limit ?? "—"}` : ""} · 页面筛选与排序不调用上游 API。`;
+      const freshnessStates = state.bankItems.map(quoteFreshness);
+      const freshnessStatus = quantMonitorFreshnessSummary(freshnessStates);
+      const freshnessText = freshnessNotice(state.bankItems);
+      dom.marketInsightsNote.dataset.freshness = freshnessStatus.status;
+      dom.marketInsightsNote.dataset.freshnessText = freshnessText;
+      dom.marketInsightsNote.textContent = `${asOf ? `数据时间 ${formatTime(asOf, true)} · ` : ""}${notice}${remaining !== null ? ` · 本机估算额度 ${remaining}/${limit ?? "—"}` : ""} · ${freshnessText} · 页面筛选与排序不调用上游 API。`;
+      dom.marketInsightsNote.setAttribute("aria-live", "polite");
     }
     if (state.selectedSymbol && !rows.some((item) => item.symbol === state.selectedSymbol)) {
       state.selectedSymbol = null;
@@ -1479,6 +1866,7 @@
   async function loadBars(symbol = state.selectedSymbol) {
     if (!symbol) {
       state.bars = [];
+      state.chartProvenance = null;
       renderCharts();
       return;
     }
@@ -1494,13 +1882,15 @@
       if (serial !== state.requestSerial || symbol !== state.selectedSymbol) return;
       const items = listFrom(payload, ["bars", "candles", "klines", "series"]);
       state.bars = items.map(normalizeBar).filter((item) => item.close !== null).slice(-300);
+      state.chartProvenance = firstDefined(objectFrom(payload), ["data_provenance"], null);
       renderCharts();
     } catch (error) {
       if (serial !== state.requestSerial) return;
       state.bars = [];
+      state.chartProvenance = null;
       renderCharts();
       dom.chartEmpty.querySelector("strong").textContent = "走势数据暂不可用";
-      dom.chartEmpty.querySelector("small").textContent = error.name === "AbortError" ? "请求超时，请稍后重试" : "等待本地数据服务提供历史行情";
+      dom.chartEmpty.querySelector("small").textContent = requestErrorMessage(error, "等待本地数据服务提供历史行情");
       throw error;
     }
   }
@@ -1518,8 +1908,16 @@
       if (symbol === state.selectedSymbol) renderAnalysis(payload);
     } catch (error) {
       if (symbol !== state.selectedSymbol) return;
+      state.analysis = null;
       setPill(dom.analysisStatus, "分析不可用", "bad");
-      if (dom.analysisNote) dom.analysisNote.textContent = error.name === "AbortError" ? "分析请求超时，请稍后重试。" : "历史行情不足或数据源暂不可用，暂不生成分析结论。";
+      renderBankFundamentals(null, symbol);
+      if (dom.analysisScore) dom.analysisScore.textContent = "—";
+      if (dom.analysisRisk) { dom.analysisRisk.textContent = "—"; dom.analysisRisk.className = ""; }
+      if (dom.analysisFactorBreakdown) dom.analysisFactorBreakdown.textContent = "";
+      renderDetailList(dom.analysisEvidence, null, "当前请求没有返回可复核的研究证据");
+      renderDetailList(dom.analysisRisks, null, "历史行情不足或数据源暂不可用");
+      renderDetailList(dom.analysisInvalidations, null, "没有有效研究结论，因此没有可执行的失效条件");
+      if (dom.analysisNote) dom.analysisNote.textContent = requestErrorMessage(error, "历史行情不足或数据源暂不可用，暂不生成分析结论。");
       throw error;
     }
   }
@@ -1539,49 +1937,299 @@
     renderSystem(payload);
   }
 
-  async function refreshAll({ notify = false } = {}) {
-    dom.refresh.classList.add("loading");
-    dom.refresh.disabled = true;
-    let sectorLoaded = false;
-    try {
-      await loadBankSector();
-      sectorLoaded = true;
-    } catch (error) {
-      // Older/custom backends remain usable. Only fall back when the aggregate
-      // bank endpoint is unavailable; generic mode keeps its existing API flow.
-      state.bankMode = false;
-      document.body.classList.remove("bank-mode");
-      state.bankPayload = null;
-      state.bankItems = [];
-      if (dom.bankToolbar) dom.bankToolbar.hidden = true;
-      if (dom.bankQuotaBadge) dom.bankQuotaBadge.hidden = true;
+  function formatResearchMetric(value, kind = "percent") {
+    const number = finiteNumber(value);
+    if (number === null) return "—";
+    if (kind === "count") return Math.round(number).toLocaleString("zh-CN");
+    if (kind === "ratio") return number.toFixed(2);
+    if (kind === "unsigned_percent") return `${(number * 100).toFixed(2)}%`;
+    return `${number >= 0 ? "+" : ""}${(number * 100).toFixed(2)}%`;
+  }
+
+  function renderResearchCompare(payload) {
+    if (!dom.researchCompareResult) return;
+    const rows = listFrom(payload, ["runs", "items"]);
+    dom.researchCompareResult.replaceChildren();
+    if (!rows.length) {
+      dom.researchCompareResult.hidden = true;
+      return;
     }
-    const tasks = [
-      ...(sectorLoaded ? [] : [loadOverview(), loadWatchlist()]),
-      loadAlerts(),
-      loadSignals(),
-      loadSystem(),
-    ];
-    const results = await Promise.allSettled(tasks);
-    const failures = results.filter((result) => result.status === "rejected");
-    dom.refresh.classList.remove("loading");
-    dom.refresh.disabled = false;
-    if (!sectorLoaded && failures.length === tasks.length) {
-      setPill(dom.apiStatus, "本地 API 未连接", "bad");
-      dom.lastUpdated.textContent = "本地服务尚未就绪，页面将自动重试";
-      if (notify) showToast("无法连接本地数据服务，请确认服务已启动", "error");
-    } else {
-      const now = new Date();
-      const marketTimes = state.watchlist
-        .map((item) => toDate(item.updatedAt))
-        .filter(Boolean);
-      state.latestMarketTime = marketTimes.length
-        ? new Date(Math.max(...marketTimes.map((item) => item.getTime())))
-        : null;
-      dom.lastUpdated.textContent = state.latestMarketTime
-        ? `页面刷新于 ${formatTime(now)} · 最新行情 ${formatTime(state.latestMarketTime, true)}`
-        : `页面刷新于 ${formatTime(now)} · 尚未收到行情`;
-      if (notify) showToast(failures.length ? `刷新完成，${failures.length} 项暂不可用` : "数据已刷新");
+    const heading = document.createElement("div");
+    heading.className = "research-compare-heading";
+    heading.textContent = `对比结果 · ${rows.length} 个研究运行（仅本地缓存）`;
+    dom.researchCompareResult.append(heading);
+    const grid = document.createElement("div");
+    grid.className = "research-compare-grid";
+    rows.forEach((row) => {
+      const card = document.createElement("article");
+      card.className = "research-compare-card";
+      const title = document.createElement("strong");
+      title.textContent = String(row.strategy_name || "未命名策略");
+      const id = document.createElement("small");
+      id.textContent = String(row.run_id || "—");
+      card.append(title, id);
+      const metrics = row.metrics && typeof row.metrics === "object" ? row.metrics : {};
+      const table = document.createElement("dl");
+      [["累计收益", formatResearchMetric(metrics.total_return)], ["年化收益", formatResearchMetric(metrics.annualized_return)],
+        ["夏普", formatResearchMetric(metrics.sharpe_ratio, "ratio")], ["最大回撤", formatResearchMetric(metrics.maximum_drawdown, "unsigned_percent")],
+        ["换手率", formatResearchMetric(metrics.turnover, "unsigned_percent")], ["交易次数", formatResearchMetric(metrics.trade_count, "count")]].forEach(([label, value]) => {
+        const dt = document.createElement("dt");
+        dt.textContent = label;
+        const dd = document.createElement("dd");
+        dd.textContent = value;
+        table.append(dt, dd);
+      });
+      card.append(table);
+      const status = document.createElement("span");
+      status.className = `research-result-status ${row.result_available ? "ok" : "neutral"}`;
+      status.textContent = row.result_available ? "结果已固化" : "尚无结果";
+      card.append(status);
+      if (row.result_available) {
+        const gate = document.createElement("small");
+        const failures = Array.isArray(row.decision_grade_failures) ? row.decision_grade_failures : [];
+        gate.className = `research-gate-status ${row.decision_grade === true ? "ok" : "warn"}`;
+        gate.textContent = row.decision_grade === true ? "研究门禁通过" : `研究门禁未通过 · ${failures.length || 1} 项证据不足`;
+        if (failures.length) gate.title = failures.join(", ");
+        card.append(gate);
+      }
+      grid.append(card);
+    });
+    dom.researchCompareResult.append(grid);
+    dom.researchCompareResult.hidden = false;
+  }
+
+  function renderResearchRuns(runs) {
+    if (!dom.researchRunsList) return;
+    const normalized = (Array.isArray(runs) ? runs : []).map((item) => ({
+      runId: String(firstDefined(item, ["run_id", "id"], "")),
+      strategy: String(firstDefined(item, ["strategy_name"], "未命名策略")),
+      dataset: String(firstDefined(item, ["dataset_name"], "未命名数据集")),
+      createdAt: firstDefined(item, ["created_at"], null),
+      hash: String(firstDefined(item, ["content_hash", "manifest_hash"], "")),
+      resultAvailable: firstDefined(item, ["result_available"], false) === true,
+    })).filter((item) => item.runId);
+    state.researchRuns = normalized;
+    const known = new Set(normalized.map((item) => item.runId));
+    state.researchSelected = new Set([...state.researchSelected].filter((id) => known.has(id)));
+    dom.researchRunsCount.textContent = `${normalized.length} 条`;
+    dom.researchRunsList.replaceChildren();
+    if (!normalized.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state compact";
+      empty.innerHTML = "<span>暂无已保存研究运行</span><small>通过研究 API 创建运行后，可在此勾选比较</small>";
+      dom.researchRunsList.append(empty);
+      dom.researchCompare.disabled = true;
+      return;
+    }
+    const list = document.createElement("div");
+    list.className = "research-run-rows";
+    normalized.forEach((run) => {
+      const label = document.createElement("div");
+      label.className = "research-run-row";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = run.runId;
+      checkbox.checked = state.researchSelected.has(run.runId);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) state.researchSelected.add(run.runId);
+        else state.researchSelected.delete(run.runId);
+        dom.researchCompare.disabled = state.researchSelected.size < 2;
+      });
+      const copy = document.createElement("label");
+      copy.className = "research-run-copy";
+      checkbox.id = `research-select-${normalized.indexOf(run)}`;
+      copy.htmlFor = checkbox.id;
+      checkbox.setAttribute("aria-label", `比较研究运行 ${run.runId}`);
+      const title = document.createElement("strong");
+      title.textContent = `${run.strategy} · ${run.runId}`;
+      const meta = document.createElement("small");
+      meta.textContent = `${run.dataset} · ${formatTime(run.createdAt, true)}${run.hash ? ` · ${run.hash.slice(0, 18)}…` : ""}`;
+      copy.append(title, meta);
+      label.append(checkbox, copy);
+
+      // Keep immutable research artifacts one click away.  These links are
+      // cache-only endpoints: downloading never spends provider quota and the
+      // server returns the canonical bytes plus integrity headers.
+      const actions = document.createElement("span");
+      actions.className = "research-run-actions";
+      const exportLink = document.createElement("a");
+      exportLink.className = "research-run-action";
+      exportLink.href = `${API_BASE}/research/runs/${encodeURIComponent(run.runId)}/export`;
+      exportLink.download = "research-run.json";
+      exportLink.textContent = "导出";
+      exportLink.title = "下载研究运行、清单与结果（仅本地缓存）";
+      exportLink.addEventListener("click", (event) => event.stopPropagation());
+      actions.append(exportLink);
+      if (run.resultAvailable) {
+        if (reportViewer) {
+          const reportButton = document.createElement("button");
+          reportButton.type = "button";
+          reportButton.className = "research-run-action";
+          reportButton.textContent = "查看报告";
+          reportButton.setAttribute("aria-controls", "research-report");
+          reportButton.setAttribute("aria-label", `查看报告 ${run.runId}`);
+          reportButton.addEventListener("click", () => {
+            reportViewer.open(run.runId);
+            dom.researchReport.scrollIntoView({ block: "nearest" });
+          });
+          actions.append(reportButton);
+        }
+        const resultLink = document.createElement("a");
+        resultLink.className = "research-run-action primary";
+        resultLink.href = `${API_BASE}/research/runs/${encodeURIComponent(run.runId)}/result/download`;
+        resultLink.download = "research-result.json";
+        resultLink.textContent = "结果";
+        resultLink.title = "下载不可变研究结果 JSON（仅本地缓存）";
+        resultLink.addEventListener("click", (event) => event.stopPropagation());
+        actions.append(resultLink);
+      }
+      label.append(actions);
+      list.append(label);
+    });
+    dom.researchRunsList.append(list);
+    dom.researchCompare.disabled = state.researchSelected.size < 2;
+  }
+
+  async function loadResearchRuns() {
+    try {
+      const payload = await fetchJSON(`${API_BASE}/research/runs?limit=20&offset=0`);
+      renderResearchRuns(listFrom(payload, ["runs", "items"]));
+      if (dom.researchRunsNote) dom.researchRunsNote.textContent = "仅读取 SQLite 中已保存的研究运行，不访问行情源；勾选至少两条运行即可比较。";
+    } catch (error) {
+      if (dom.researchRunsCount) dom.researchRunsCount.textContent = "不可用";
+      if (dom.researchRunsNote) dom.researchRunsNote.textContent = "研究运行接口暂不可用；行情与分析页面仍可继续使用。";
+      if (dom.researchRunsList) {
+        dom.researchRunsList.replaceChildren();
+        const empty = document.createElement("div");
+        empty.className = "empty-state compact";
+        empty.innerHTML = "<span>研究运行读取失败</span><small>请确认本地服务已就绪后刷新</small>";
+        dom.researchRunsList.append(empty);
+      }
+    }
+  }
+
+  async function compareSelectedResearchRuns() {
+    const ids = [...state.researchSelected];
+    if (ids.length < 2 || !dom.researchCompare) return;
+    dom.researchCompare.disabled = true;
+    dom.researchCompare.classList.add("loading");
+    try {
+      const payload = await fetchJSON(`${API_BASE}/research/runs/compare?run_ids=${encodeURIComponent(ids.join(","))}`, { timeout: 15000 });
+      renderResearchCompare(payload);
+    } catch (error) {
+      showToast("研究运行比较失败，请检查所选运行是否仍存在", "error");
+    } finally {
+      dom.researchCompare.classList.remove("loading");
+      dom.researchCompare.disabled = state.researchSelected.size < 2;
+    }
+  }
+
+  async function refreshAll({ notify = false } = {}) {
+    if (state.refreshInFlight) {
+      // Do not start a second fan-out while one is already collecting the
+      // cache-backed panels.  A manual click still gets the same completion
+      // promise and therefore remains predictable for callers.
+      return state.refreshInFlight;
+    }
+    const run = (async () => {
+      dom.refresh.classList.add("loading");
+      dom.refresh.disabled = true;
+      let sectorLoaded = false;
+      try {
+        await loadBankSector();
+        sectorLoaded = true;
+      } catch (error) {
+        // Older/custom backends remain usable. Only fall back when the aggregate
+        // bank endpoint is unavailable; generic mode keeps its existing API flow.
+        state.bankMode = false;
+        document.body.classList.remove("bank-mode");
+        state.bankPayload = null;
+        state.bankItems = [];
+        if (dom.bankToolbar) dom.bankToolbar.hidden = true;
+        if (dom.bankQuotaBadge) dom.bankQuotaBadge.hidden = true;
+      }
+      const tasks = [
+        ...(sectorLoaded ? [] : [loadOverview(), loadWatchlist()]),
+        loadAlerts(),
+        loadSignals(),
+        loadSystem(),
+        loadResearchRuns(),
+      ];
+      const results = await Promise.allSettled(tasks);
+      const failures = results.filter((result) => result.status === "rejected");
+      if (!sectorLoaded && failures.length === tasks.length) {
+        setPill(dom.apiStatus, "本地 API 未连接", "bad");
+        dom.lastUpdated.textContent = "本地服务尚未就绪，页面将自动重试";
+        if (notify) {
+          const firstFailure = failures.find((result) => result.reason);
+          showToast(firstFailure ? requestErrorMessage(firstFailure.reason, "无法连接本地数据服务，请确认服务已启动") : "无法连接本地数据服务，请确认服务已启动", "error");
+        }
+      } else {
+        const now = new Date();
+        const marketTimes = state.watchlist
+          .map((item) => toDate(item.updatedAt))
+          .filter(Boolean);
+        state.latestMarketTime = marketTimes.length
+          ? new Date(Math.max(...marketTimes.map((item) => item.getTime())))
+          : null;
+        dom.lastUpdated.textContent = state.latestMarketTime
+          ? `页面刷新于 ${formatTime(now)} · 最新行情 ${formatTime(state.latestMarketTime, true)}`
+          : `页面刷新于 ${formatTime(now)} · 尚未收到行情`;
+        if (notify) showToast(failures.length ? `刷新完成，${failures.length} 项暂不可用` : "数据已刷新");
+      }
+    })();
+    state.refreshInFlight = run;
+    try {
+      return await run;
+    } finally {
+      if (state.refreshInFlight === run) state.refreshInFlight = null;
+      dom.refresh.classList.remove("loading");
+      dom.refresh.disabled = false;
+    }
+  }
+
+  async function collectLatest() {
+    if (!dom.collectNow || dom.collectNow.disabled) return;
+    dom.collectNow.disabled = true;
+    dom.collectNow.classList.add("loading");
+    // Keep one key for the whole user-triggered submission, so a network
+    // timeout or browser retry cannot enqueue a second provider cycle.
+    state.collectionIdempotencyKey = (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function")
+      ? globalThis.crypto.randomUUID()
+      : `dashboard-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const submitted = await fetchJSON(`${API_BASE}/collector/jobs`, {
+        method: "POST",
+        headers: { "Idempotency-Key": state.collectionIdempotencyKey },
+      });
+      const jobId = firstDefined(submitted, ["job_id", "id"], null);
+      if (!jobId) throw new Error("采集作业未返回 job_id");
+      showToast("最新行情采集已提交，正在等待结果");
+      let terminal = null;
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, attempt ? 500 : 150));
+        terminal = await fetchJSON(`${API_BASE}/collector/jobs/${encodeURIComponent(jobId)}`);
+        if (terminal && terminal.terminal) break;
+      }
+      if (!terminal || !terminal.terminal) {
+        showToast("采集仍在后台进行，可稍后查看系统状态", "info");
+      } else if (terminal.status === "succeeded") {
+        showToast("最新行情采集完成，页面已刷新");
+        await refreshAll();
+      } else if (terminal.status === "cancelled") {
+        showToast("采集已取消", "error");
+      } else {
+        showToast(`采集未完成：${terminal.error_type || terminal.status || "未知错误"}`, "error");
+      }
+    } catch (error) {
+      if (error && error.status === 409) {
+        showToast("已有采集任务运行中，请稍后查看系统状态", "error");
+      } else {
+        showToast(requestErrorMessage(error, "无法提交采集任务，请确认本地服务已就绪"), "error");
+      }
+    } finally {
+      dom.collectNow.disabled = false;
+      dom.collectNow.classList.remove("loading");
     }
   }
 
@@ -1703,8 +2351,13 @@
     const weekday = parts.weekday;
     const workday = !["Sat", "Sun"].includes(weekday);
     if (state.marketStatus && Date.now() - state.marketStatus.receivedAt < POLL_INTERVAL * 2) {
-      const status = state.marketStatus.trading ? "ok" : ["auction", "preopen", "call_auction", "集合竞价"].includes(state.marketStatus.phase) ? "warning" : "closed";
+      const calendarUnknown = state.marketStatus.calendarLookup === "unknown"
+        || state.marketStatus.calendar === "weekday_fallback" && !["open", "closed"].includes(state.marketStatus.calendarLookup);
+      const status = calendarUnknown ? "warning" : state.marketStatus.trading ? "ok" : ["auction", "preopen", "call_auction", "集合竞价"].includes(state.marketStatus.phase) ? "warning" : "closed";
       setPill(dom.marketBadge, state.marketStatus.label, status);
+      if (dom.marketBadge) dom.marketBadge.title = calendarUnknown
+        ? "交易日历未覆盖当前日期，市场状态仅按工作日规则估计"
+        : "";
       return;
     }
     let text = "休市";
@@ -1724,6 +2377,8 @@
 
   function bindEvents() {
     dom.refresh.addEventListener("click", () => refreshAll({ notify: true }));
+    dom.collectNow?.addEventListener("click", collectLatest);
+    dom.researchCompare?.addEventListener("click", compareSelectedResearchRuns);
     el("open-settings").addEventListener("click", () => {
       if (typeof dom.settings.showModal === "function") dom.settings.showModal();
       else dom.settings.setAttribute("open", "");

@@ -170,6 +170,17 @@ class Quote:
         object.__setattr__(self, "turnover", _decimal(self.turnover, "turnover"))
         if self.high is not None and self.low is not None and self.high < self.low:
             raise ValueError("quote high cannot be below low")
+        if self.bid is not None and self.ask is not None and self.bid > self.ask:
+            # A crossed book is not a valid two-sided snapshot.  Keeping it
+            # would make spread/liquidity calculations look meaningful while
+            # actually encoding a provider or ordering error.  One-sided
+            # books remain valid because an absent side is common outside the
+            # continuous session and must not be replaced with zero.
+            raise ValueError("quote bid cannot be above ask")
+        for field_name in ("last", "open", "high", "low", "previous_close"):
+            value = getattr(self, field_name)
+            if value is not None and value < 0:
+                raise ValueError("quote {} cannot be negative".format(field_name))
         object.__setattr__(self, "source", str(self.source))
 
 

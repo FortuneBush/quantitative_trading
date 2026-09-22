@@ -8,6 +8,7 @@ from .base import (
     Strategy,
     StrategyContext,
     StrategyRegistry,
+    strategy_parameter_schema,
 )
 from .moving_average import MovingAverageCrossStrategy
 
@@ -20,4 +21,5 @@ __all__ = [
     "Strategy",
     "StrategyContext",
     "StrategyRegistry",
+    "strategy_parameter_schema",
 ]

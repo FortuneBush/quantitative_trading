@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import hashlib
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -23,6 +24,12 @@ from quant_monitor.storage.migrations import (
     V1_INITIAL_SCHEMA,
     V2_MIGRATION_METADATA,
     V3_COLLECTION_LINEAGE,
+    V4_RESEARCH_RUNS,
+    V5_RESEARCH_RESULTS,
+    V6_COLLECTION_JOBS,
+    V7_FUNDAMENTAL_OBSERVATIONS,
+    V8_CORPORATE_ACTIONS_AND_ADJUSTMENT_FACTORS,
+    V9_POINT_IN_TIME_UNIVERSE_SNAPSHOTS,
 )
 
 
@@ -111,8 +118,8 @@ def test_existing_v1_database_upgrades_without_changing_legacy_data(tmp_path):
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
     version, rows = inspect_migrations(path)
-    assert version == SQLiteRepository.SCHEMA_VERSION == 3
-    assert [row[0] for row in rows] == [1, 2, 3]
+    assert version == SQLiteRepository.SCHEMA_VERSION
+    assert [row[0] for row in rows] == list(range(1, SQLiteRepository.SCHEMA_VERSION + 1))
     assert [row[1] for row in rows] == [item.checksum for item in DEFAULT_MIGRATIONS]
     assert all(datetime.fromisoformat(row[2]).utcoffset() is not None for row in rows)
 
@@ -140,7 +147,7 @@ def test_v2_to_v3_is_additive_and_does_not_backfill_untrusted_legacy_bars(tmp_pa
     repository.close()
 
     with sqlite3.connect(str(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SQLiteRepository.SCHEMA_VERSION
         assert connection.execute("SELECT COUNT(*) FROM bars").fetchone()[0] == 1
         assert connection.execute(
             "SELECT COUNT(*) FROM bar_observations"
@@ -184,7 +191,7 @@ def test_fresh_database_uses_runner_and_second_initialize_is_idempotent(tmp_path
     after = inspect_migrations(path)
 
     assert before == after
-    assert before[0] == 3
+    assert before[0] == SQLiteRepository.SCHEMA_VERSION
     with sqlite3.connect(str(path)) as connection:
         tables = {
             row[0]
@@ -319,7 +326,7 @@ def test_migration_that_breaks_prior_schema_rolls_back_everything(tmp_path):
     base.initialize()
     base.close()
     destructive = Migration(
-        version=4,
+        version=SQLiteRepository.SCHEMA_VERSION + 1,
         name="invalid_drop_required_table",
         statements=("DROP TABLE bars",),
     )
@@ -329,13 +336,13 @@ def test_migration_that_breaks_prior_schema_rolls_back_everything(tmp_path):
             MigrationRunner(DEFAULT_MIGRATIONS + (destructive,)).migrate(connection)
 
     with sqlite3.connect(str(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SQLiteRepository.SCHEMA_VERSION
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bars'"
         ).fetchone()
         assert connection.execute(
             "SELECT COUNT(*) FROM schema_migrations"
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == SQLiteRepository.SCHEMA_VERSION
 
 
 def test_repository_does_not_repair_schema_outside_migration_ledger(tmp_path):
@@ -386,7 +393,19 @@ def test_legacy_newline_collision_cannot_authenticate_changed_current_definition
             "SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version"
         ).fetchall()
         with pytest.raises(MigrationChecksumError, match="checksum"):
-            MigrationRunner((collision_b, V2_MIGRATION_METADATA, V3_COLLECTION_LINEAGE)).migrate(connection)
+            MigrationRunner(
+                    (
+                        collision_b,
+                        V2_MIGRATION_METADATA,
+                        V3_COLLECTION_LINEAGE,
+                        V4_RESEARCH_RUNS,
+                        V5_RESEARCH_RESULTS,
+                        V6_COLLECTION_JOBS,
+                        V7_FUNDAMENTAL_OBSERVATIONS,
+                        V8_CORPORATE_ACTIONS_AND_ADJUSTMENT_FACTORS,
+                        V9_POINT_IN_TIME_UNIVERSE_SNAPSHOTS,
+                    )
+            ).migrate(connection)
         after = connection.execute(
             "SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version"
         ).fetchall()
@@ -550,8 +569,8 @@ def test_concurrent_fresh_database_initialization_converges(tmp_path):
     assert all(not thread.is_alive() for thread in threads)
     assert failures == []
     version, rows = inspect_migrations(path)
-    assert version == 3
-    assert [row[0] for row in rows] == [1, 2, 3]
+    assert version == SQLiteRepository.SCHEMA_VERSION
+    assert [row[0] for row in rows] == list(range(1, SQLiteRepository.SCHEMA_VERSION + 1))
 
 
 def _create_modified_legacy_v1(path, transform):
@@ -745,3 +764,29 @@ def test_repository_retries_native_migration_lock(monkeypatch, tmp_path):
         assert calls["count"] == 3
     finally:
         repository.close()
+
+
+def test_repository_initialization_timeout_is_bounded_for_persistent_lock(
+    monkeypatch, tmp_path
+):
+    """A runtime deadline must also bound the native SQLite migration worker."""
+
+    calls = {"count": 0}
+
+    def persistent_lock(self, connection):
+        calls["count"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MigrationRunner, "migrate", persistent_lock)
+    repository = SQLiteRepository(
+        tmp_path / "bounded-lock.sqlite3",
+        initialization_timeout_seconds=0.08,
+    )
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="SQLite initialization exceeded"):
+        repository.initialize()
+    # The exact value depends on filesystem scheduling, but the provider must
+    # not fall back to sqlite's historical 5-second busy timeout in bounded
+    # startup mode.
+    assert time.monotonic() - started < 1.0
+    assert calls["count"] >= 1

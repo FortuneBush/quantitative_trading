@@ -1,6 +1,15 @@
 """Core domain objects for the local A-share monitoring platform."""
 
 from .events import EventType, MarketEvent
+from .fundamentals import FundamentalObservation, fundamentals_as_of
+from .corporate_actions import (
+    AdjustedBar,
+    AdjustmentFactor,
+    CorporateAction,
+    CorporateActionEffect,
+    CorporateActionType,
+    apply_corporate_action,
+)
 from .lineage import (
     Adjustment,
     BarObservation,
@@ -31,12 +40,18 @@ from .models import (
 __all__ = [
     "Alert",
     "AlertLevel",
+    "AdjustedBar",
     "Adjustment",
+    "AdjustmentFactor",
     "Bar",
     "BarObservation",
     "CollectionBatch",
     "CollectionBatchStatus",
+    "CorporateAction",
+    "CorporateActionEffect",
+    "CorporateActionType",
     "EventType",
+    "FundamentalObservation",
     "Exchange",
     "Instrument",
     "MarketEvent",
@@ -48,6 +63,8 @@ __all__ = [
     "Signal",
     "SignalAction",
     "ensure_market_time",
+    "apply_corporate_action",
+    "fundamentals_as_of",
     "normalize_symbol",
     "normalized_request_hash",
     "now_market_time",

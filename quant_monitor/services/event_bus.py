@@ -97,11 +97,14 @@ class EventBus:
         )
         failures = [result for result in results if isinstance(result, BaseException)]
         for failure in failures:
-            _LOGGER.exception(
-                "event handler failed for %s: %s",
+            # Handler exceptions can contain provider URLs, credentials or
+            # local paths.  Keep logs useful without serializing the failure
+            # text or traceback; callers still receive the original exception
+            # when ``raise_handler_errors`` is enabled.
+            _LOGGER.error(
+                "event handler failed for %s error_type=%s",
                 market_event.type.value,
-                failure,
-                exc_info=(type(failure), failure, failure.__traceback__),
+                type(failure).__name__,
             )
         if failures and self._raise_handler_errors:
             raise failures[0]

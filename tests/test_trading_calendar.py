@@ -9,9 +9,14 @@ from quant_monitor.services import DailyBarDataQualityService
 from quant_monitor.trading_calendar import (
     CalendarMetadata,
     CalendarRangeError,
+    CalendarSnapshotError,
+    CalendarSnapshotStore,
     TradingCalendar,
     VersionedSessionCalendar,
     WeekdayFallbackCalendar,
+    load_calendar_snapshot,
+    session_offset,
+    write_calendar_snapshot,
 )
 
 
@@ -53,6 +58,158 @@ def test_calendar_protocol_and_metadata_are_explicitly_unverified_and_immutable(
         target.metadata.version = "changed"
     with pytest.raises(AttributeError):
         target.metadata.verified = True
+
+
+def test_versioned_calendar_snapshot_round_trip_is_deterministic_and_integrity_checked():
+    target = calendar()
+    snapshot = target.to_snapshot()
+
+    assert snapshot["schema_version"] == 1
+    assert snapshot["sessions"] == [item.isoformat() for item in SESSIONS]
+    assert snapshot["fingerprint"] == target.fingerprint
+    restored = VersionedSessionCalendar.from_snapshot(snapshot)
+    assert restored.session_dates == target.session_dates
+    assert restored.metadata.to_dict() == target.metadata.to_dict()
+    assert restored.fingerprint == target.fingerprint
+    assert restored.to_snapshot() == snapshot
+    assert target.snapshot() == snapshot
+
+
+def test_snapshot_file_helpers_and_append_only_store_preserve_revisions(tmp_path):
+    first = calendar()
+    direct_path = tmp_path / "first.json"
+    assert write_calendar_snapshot(first, direct_path) == direct_path
+    assert load_calendar_snapshot(direct_path).fingerprint == first.fingerprint
+    # Idempotent publication of the same immutable revision is safe.
+    assert write_calendar_snapshot(first, direct_path) == direct_path
+
+    revised = VersionedSessionCalendar(
+        SESSIONS + (date(2026, 10, 13),),
+        source="offline_test_fixture",
+        version="2026.fixture.2",
+        identifier="cn_a_offline_fixture",
+    )
+    with pytest.raises(CalendarSnapshotError, match="refusing to replace"):
+        write_calendar_snapshot(revised, direct_path)
+
+    store = CalendarSnapshotStore(tmp_path / "calendar-store")
+    first_path = store.save(first)
+    second_path = store.save(revised)
+    assert first_path.name == first.fingerprint + ".json"
+    assert second_path.name == revised.fingerprint + ".json"
+    assert first_path != second_path
+    assert store.load(first.fingerprint).metadata.version == "2026.fixture.1"
+    assert store.load(revised.fingerprint).metadata.version == "2026.fixture.2"
+    assert {item.fingerprint for item in store.list()} == {
+        first.fingerprint,
+        revised.fingerprint,
+    }
+
+
+def test_weekday_rule_builder_handles_holidays_and_weekend_makeup_sessions():
+    target = VersionedSessionCalendar.from_weekday_rules(
+        date(2026, 10, 1),
+        date(2026, 10, 11),
+        holidays=(date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 5)),
+        makeup_sessions=(date(2026, 10, 10),),
+        source="offline_exchange_fixture",
+        version="2026-holiday-v1",
+    )
+    assert target.session_dates == (
+        date(2026, 10, 6),
+        date(2026, 10, 7),
+        date(2026, 10, 8),
+        date(2026, 10, 9),
+        date(2026, 10, 10),
+    )
+    assert target.is_session(date(2026, 10, 10)) is True
+    assert target.is_session(date(2026, 10, 11)) is False
+    with pytest.raises(ValueError, match="overlap"):
+        VersionedSessionCalendar.from_weekday_rules(
+            date(2026, 10, 1), date(2026, 10, 2),
+            holidays=(date(2026, 10, 1),),
+            makeup_sessions=(date(2026, 10, 1),),
+            source="fixture", version="v1",
+        )
+    with pytest.raises(ValueError, match="outside requested range"):
+        VersionedSessionCalendar.from_weekday_rules(
+            date(2026, 10, 1), date(2026, 10, 2),
+            holidays=(date(2026, 10, 3),), source="fixture", version="v1",
+        )
+    with pytest.raises(ValueError, match="holidays must be weekdays"):
+        VersionedSessionCalendar.from_weekday_rules(
+            date(2026, 10, 1), date(2026, 10, 4),
+            holidays=(date(2026, 10, 3),), source="fixture", version="v1",
+        )
+    with pytest.raises(ValueError, match="makeup_sessions must be weekend"):
+        VersionedSessionCalendar.from_weekday_rules(
+            date(2026, 10, 1), date(2026, 10, 4),
+            makeup_sessions=(date(2026, 10, 2),), source="fixture", version="v1",
+        )
+
+
+def test_snapshot_file_rejects_duplicate_json_keys_and_tampered_store_names(tmp_path):
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text(
+        '{"schema_version":1,"schema_version":1}', encoding="utf-8"
+    )
+    with pytest.raises(CalendarSnapshotError, match="duplicate field"):
+        load_calendar_snapshot(duplicate)
+
+    store = CalendarSnapshotStore(tmp_path / "store")
+    store.root.mkdir()
+    (store.root / "not-a-fingerprint.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(CalendarSnapshotError, match="unexpected calendar snapshot filename"):
+        store.list()
+    with pytest.raises(ValueError, match="path cannot be empty"):
+        load_calendar_snapshot("")
+    with pytest.raises(ValueError, match="path cannot be empty"):
+        CalendarSnapshotStore("")
+
+
+def test_snapshot_import_contract_can_pin_fingerprint_and_declared_identity(tmp_path):
+    target = calendar()
+    path = tmp_path / "calendar.json"
+    write_calendar_snapshot(target, path)
+
+    assert load_calendar_snapshot(
+        path,
+        expected_fingerprint=target.fingerprint,
+        expected_identifier=target.metadata.identifier,
+        expected_source=target.metadata.source,
+        expected_version=target.metadata.version,
+    ).fingerprint == target.fingerprint
+
+    with pytest.raises(CalendarSnapshotError, match="fingerprint mismatch"):
+        load_calendar_snapshot(path, expected_fingerprint="0" * 64)
+    with pytest.raises(CalendarSnapshotError, match="identifier mismatch"):
+        load_calendar_snapshot(path, expected_identifier="another-calendar")
+    with pytest.raises(CalendarSnapshotError, match="source mismatch"):
+        load_calendar_snapshot(path, expected_source="untrusted-import")
+    with pytest.raises(CalendarSnapshotError, match="version mismatch"):
+        load_calendar_snapshot(path, expected_version="2026.fixture.0")
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        load_calendar_snapshot(path, expected_fingerprint=target.fingerprint.upper())
+    with pytest.raises(ValueError, match="expected_source"):
+        load_calendar_snapshot(path, expected_source=" ")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: dict(value, fingerprint="0" * 64),
+        lambda value: dict(value, sessions=list(value["sessions"][:-1])),
+        lambda value: dict(value, unexpected="field"),
+        lambda value: dict(value, schema_version=2),
+        lambda value: dict(value, sessions=["2026-09-25", "2026-09-25"]),
+        lambda value: dict(value, sessions=["2026/09/25"]),
+        lambda value: dict(value, source=123),
+        lambda value: {**value, 1: "invalid-field-name"},
+    ],
+)
+def test_versioned_calendar_snapshot_rejects_tampering_and_schema_drift(mutate):
+    with pytest.raises(CalendarSnapshotError):
+        VersionedSessionCalendar.from_snapshot(mutate(calendar().to_snapshot()))
 
 
 def test_versioned_calendar_handles_weekends_holidays_and_adjacent_sessions():
@@ -100,6 +257,7 @@ def test_market_status_preserves_shape_and_exposes_calendar_lineage():
     assert result["calendar"] == "cn_a_offline_fixture"
     assert result["calendar_source"] == "offline_test_fixture"
     assert result["calendar_version"] == "2026.fixture.1"
+    assert result["calendar_fingerprint"] == target.fingerprint
     assert result["calendar_verified"] is False
 
 
@@ -116,6 +274,7 @@ def test_data_quality_reuses_versioned_sessions_not_weekday_guesses():
     assert summary.calendar_source == "offline_test_fixture"
     assert summary.calendar_version == "2026.fixture.1"
     assert summary.calendar_verified is False
+    assert summary.calendar_fingerprint == target.fingerprint
     assert summary.expected_latest_date == "2026-10-09"
     assert summary.symbols[0].missing_dates == (
         "2026-09-29",
@@ -169,6 +328,28 @@ def test_weekday_fallback_remains_explicit_and_weekend_aware():
     assert target.latest_published_session(
         datetime(2026, 9, 28, 15, 29, tzinfo=SHANGHAI_TZ)
     ) == date(2026, 9, 25)
+
+
+def test_session_offset_uses_previous_session_anchor_and_preserves_finite_bounds():
+    target = calendar()
+
+    # A holiday/weekend is anchored to the most recent known session.  This
+    # prevents callers from accidentally treating a natural-day increment as
+    # the next tradable session.
+    assert session_offset(target, date(2026, 10, 8), 0) == date(2026, 9, 30)
+    assert session_offset(target, date(2026, 10, 8), 1) == date(2026, 10, 9)
+    assert session_offset(target, date(2026, 10, 8), -1) == date(2026, 9, 29)
+    assert session_offset(target, date(2026, 9, 29), 0) == date(2026, 9, 29)
+
+    with pytest.raises(CalendarRangeError, match="no next session"):
+        session_offset(target, SESSIONS[-1], 1)
+    with pytest.raises(CalendarRangeError, match="no previous session"):
+        session_offset(target, SESSIONS[0], -1)
+    for invalid in (True, 1.0, "1"):
+        with pytest.raises(TypeError, match="offset must be an integer"):
+            session_offset(target, SESSIONS[1], invalid)
+    with pytest.raises(CalendarRangeError, match="outside calendar coverage"):
+        session_offset(target, date(2026, 10, 13), 0)
 
 
 def test_public_results_do_not_trust_structural_protocol_verified_metadata():

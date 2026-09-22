@@ -12,9 +12,10 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Sequence
+from datetime import datetime
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from quant_monitor.domain import Bar, Signal, SignalAction
+from quant_monitor.domain import Bar, Signal, SignalAction, ensure_market_time, normalize_symbol
 
 from .base import CohortStrategy, CohortStrategyContext, StrategyContext
 
@@ -49,6 +50,10 @@ class BankDailyMultifactorStrategy(CohortStrategy):
 
     MODEL_VERSION = "bank_daily_multifactor_v1"
     PRICE_BASIS = "raw_unadjusted"
+    # The longest factor needs 121 rows (120-session momentum plus its base).
+    # Corporate-action suspicion is evaluated over exactly this causal window
+    # rather than over arbitrary older history supplied by a cache.
+    MAX_FACTOR_LOOKBACK = 121
 
     def __init__(
         self,
@@ -64,6 +69,7 @@ class BankDailyMultifactorStrategy(CohortStrategy):
         corporate_action_gap: float = 0.06,
         trend_exit_days: int = 2,
         valid_sessions: int = 5,
+        fundamental_weight: float = 0.20,
         strategy_name: str = MODEL_VERSION,
     ) -> None:
         self.min_history = int(min_history)
@@ -77,6 +83,7 @@ class BankDailyMultifactorStrategy(CohortStrategy):
         self.corporate_action_gap = float(corporate_action_gap)
         self.trend_exit_days = int(trend_exit_days)
         self.valid_sessions = int(valid_sessions)
+        self.fundamental_weight = float(fundamental_weight)
         self._name = str(strategy_name).strip()
         if self.min_history < 121:
             raise ValueError("min_history must be at least 121")
@@ -100,6 +107,8 @@ class BankDailyMultifactorStrategy(CohortStrategy):
             raise ValueError("trend_exit_days must be positive")
         if self.valid_sessions < 1:
             raise ValueError("valid_sessions must be positive")
+        if not math.isfinite(self.fundamental_weight) or not 0.0 <= self.fundamental_weight < 1.0:
+            raise ValueError("fundamental_weight must be between 0 and 1")
         if not self._name:
             raise ValueError("strategy_name cannot be empty")
 
@@ -127,8 +136,17 @@ class BankDailyMultifactorStrategy(CohortStrategy):
         return worst
 
     def _suspected_corporate_action(self, bars: Sequence[Bar]) -> bool:
-        recent = bars[-6:]
-        for previous, current in zip(recent, recent[1:]):
+        """Detect discontinuities anywhere in the factor lookback window.
+
+        The strategy uses up to 120 sessions of price history for its factors.
+        Restricting the check to only the last few bars allows an older
+        ex-dividend/split gap to remain in the momentum and drawdown inputs,
+        which can create a false cross-sectional ranking.  We intentionally
+        keep this as a conservative *suspicion* gate (rather than attempting
+        to infer an adjustment factor); a provider with corporate-action
+        lineage can later replace the raw bars with adjusted observations.
+        """
+        for previous, current in zip(bars, bars[1:]):
             previous_close = float(previous.close)
             if previous_close <= 0:
                 return True
@@ -188,7 +206,9 @@ class BankDailyMultifactorStrategy(CohortStrategy):
                 or drawdown <= -self.maximum_drawdown
             ),
             trend_exit=trend_exit,
-            suspected_corporate_action=self._suspected_corporate_action(bars),
+            suspected_corporate_action=self._suspected_corporate_action(
+                bars[-self.MAX_FACTOR_LOOKBACK :]
+            ),
         )
 
     @staticmethod
@@ -218,8 +238,118 @@ class BankDailyMultifactorStrategy(CohortStrategy):
 
     @staticmethod
     def _rank_from_top(scores: Mapping[str, float], symbol: str) -> int:
-        ordered = sorted(scores, key=lambda item: (-scores[item], item))
-        return ordered.index(symbol) + 1
+        """Return a competition rank without using symbol order as a tiebreaker.
+
+        A deterministic symbol sort is useful when rendering a table, but it
+        must not leak into the reported cross-sectional rank: two securities
+        with the same composite score are equally ranked.  The previous
+        implementation returned different ranks for ties, which made the UI
+        imply a spurious preference even though entry eligibility was based on
+        the score itself.
+        """
+        if symbol not in scores:
+            raise KeyError(symbol)
+        target = float(scores[symbol])
+        return 1 + sum(1 for value in scores.values() if float(value) > target)
+
+    def _fundamental_overlay(
+        self,
+        context: CohortStrategyContext,
+        observations: Sequence[_Observation],
+    ) -> Mapping[str, Any]:
+        """Validate an optional point-in-time factor report without I/O."""
+
+        weight = self.fundamental_weight
+        base: Dict[str, Any] = {
+            "enabled": False,
+            "status": "disabled" if weight == 0.0 else "unavailable",
+            "weight": weight,
+            "reason": (
+                "fundamental_overlay_disabled"
+                if weight == 0.0
+                else "fundamental_data_unavailable_price_only_fallback"
+            ),
+            "decision_at": None,
+            "scores": {},
+        }
+        if weight == 0.0:
+            return base
+        report = context.metadata.get("fundamental_factor_report")
+        if not isinstance(report, Mapping):
+            return base
+        if report.get("selection") != "bank_fundamental_factors_as_of_v1":
+            base["reason"] = "fundamental_report_selection_invalid"
+            return base
+        try:
+            decision_at = ensure_market_time(
+                datetime.fromisoformat(str(report["decision_at"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            base["reason"] = "fundamental_report_decision_time_invalid"
+            return base
+        base["decision_at"] = decision_at.isoformat()
+        if decision_at > context.timestamp:
+            base["reason"] = "fundamental_report_future_of_decision"
+            return base
+        quality = report.get("quality")
+        if not isinstance(quality, Mapping) or quality.get("status") != "ok":
+            base["reason"] = "fundamental_report_not_complete"
+            return base
+        if report.get("warnings") not in (None, [], ()):
+            base["reason"] = "fundamental_report_has_warnings"
+            return base
+        items = report.get("items")
+        if not isinstance(items, (list, tuple)) or len(items) < 2:
+            base["reason"] = "fundamental_report_cross_section_too_small"
+            return base
+        if quality.get("complete_count") != len(items):
+            base["reason"] = "fundamental_report_coverage_mismatch"
+            return base
+        expected_symbols = {item.symbol for item in observations}
+        scores: Dict[str, float] = {}
+        for item in items:
+            if not isinstance(item, Mapping):
+                base["reason"] = "fundamental_report_item_invalid"
+                return base
+            try:
+                symbol = normalize_symbol(item["symbol"])
+                score = item["score"]
+            except (KeyError, TypeError, ValueError):
+                base["reason"] = "fundamental_report_item_invalid"
+                return base
+            if item.get("score_status") != "complete" or isinstance(score, bool):
+                base["reason"] = "fundamental_report_score_unavailable"
+                return base
+            if any(
+                item.get(key)
+                for key in (
+                    "missing_metrics",
+                    "invalid_unit_metrics",
+                    "invalid_scope_metrics",
+                    "incomparable_period_metrics",
+                )
+            ) or item.get("source_conflict") or item.get("scope_conflict"):
+                base["reason"] = "fundamental_report_item_incomplete"
+                return base
+            try:
+                score = float(score)
+            except (TypeError, ValueError):
+                base["reason"] = "fundamental_report_score_invalid"
+                return base
+            if not math.isfinite(score) or not 0.0 <= score <= 1.0 or symbol in scores:
+                base["reason"] = "fundamental_report_score_invalid"
+                return base
+            scores[symbol] = score
+        if set(scores) != expected_symbols:
+            base["reason"] = "fundamental_report_universe_mismatch"
+            return base
+        base.update({
+            "enabled": True,
+            "status": "applied",
+            "reason": "fundamental_overlay_applied",
+            "scores": scores,
+        })
+        return base
 
     def evaluate(self, context: CohortStrategyContext) -> Sequence[Signal]:
         snapshot = self.analyze(context)
@@ -238,6 +368,27 @@ class BankDailyMultifactorStrategy(CohortStrategy):
         generation.  API callers can therefore show neutral/insufficient
         states without fabricating a Signal or performing any I/O.
         """
+
+        # Live provider observations currently carry degraded/unverified
+        # lineage until a vendor supplies accepted availability and revision
+        # evidence.  The monitoring orchestrator can explicitly mark such a
+        # cohort as not decision-ready; fail closed before ranking so a
+        # mathematically valid cross-sectional score cannot become a BUY/SELL
+        # signal. Direct pure-strategy/backtest callers that do not provide
+        # this optional marker retain deterministic behavior.
+        if context.metadata.get("strategy_decision_ready") is False:
+            excluded = {
+                symbol: "data_quality_not_decision_ready"
+                for symbol in context.members
+            }
+            return {
+                "ready": False,
+                "reason": "data_quality_not_decision_ready",
+                "valid_universe": 0,
+                "required_universe": self.min_universe,
+                "excluded": excluded,
+                "items": (),
+            }
 
         observations = []
         excluded = {}
@@ -299,6 +450,7 @@ class BankDailyMultifactorStrategy(CohortStrategy):
             ),
             ("shallow_drawdown_60", lambda item: item.max_drawdown_60, True, 0.15),
         )
+        factor_weights = {name: weight for name, _getter, _higher, weight in factor_specs}
         ranks: Dict[str, Dict[str, float]] = {item.symbol: {} for item in observations}
         scores = {item.symbol: 0.0 for item in observations}
         for name, getter, higher_is_better, weight in factor_specs:
@@ -311,6 +463,15 @@ class BankDailyMultifactorStrategy(CohortStrategy):
         liquidity_ranks = self._percentile_ranks(
             observations, lambda item: item.average_turnover_20
         )
+        fundamental_overlay = self._fundamental_overlay(context, observations)
+        price_scores = dict(scores)
+        if fundamental_overlay["enabled"]:
+            overlay_scores = fundamental_overlay["scores"]
+            for symbol in scores:
+                scores[symbol] = (
+                    price_scores[symbol] * (1.0 - self.fundamental_weight)
+                    + overlay_scores[symbol] * self.fundamental_weight
+                )
         breadth = statistics.fmean(
             float(item.latest.close) > item.sma_120 for item in observations
         )
@@ -318,6 +479,20 @@ class BankDailyMultifactorStrategy(CohortStrategy):
         results = []
         for item in sorted(observations, key=lambda value: value.symbol):
             score = scores[item.symbol]
+            fundamental_score = (
+                float(fundamental_overlay["scores"][item.symbol])
+                if fundamental_overlay["enabled"]
+                else None
+            )
+            fundamental_contribution = (
+                fundamental_score * self.fundamental_weight
+                if fundamental_score is not None
+                else 0.0
+            )
+            factor_contributions = {
+                name: ranks[item.symbol][name] * weight
+                for name, weight in factor_weights.items()
+            }
             gates = {
                 "review_due": item.review_due,
                 "breadth_ok": breadth >= self.minimum_breadth,
@@ -332,6 +507,29 @@ class BankDailyMultifactorStrategy(CohortStrategy):
                     liquidity_ranks[item.symbol] >= self.liquidity_floor_percentile
                 ),
             }
+            # Keep the decision path explicit for UI/API consumers.  A plain
+            # action (BUY/HOLD/SELL) is not enough to explain why a candidate
+            # was rejected or why a risk exit won; expose stable gate names so
+            # downstream clients do not have to reverse-engineer thresholds.
+            gate_failures = tuple(
+                name for name, passed in gates.items() if not bool(passed)
+            )
+            # ``gate_failures`` describes the boolean health gates above, but
+            # a symbol can still be ineligible when every gate passes: the
+            # cross-sectional score may be below the entry threshold or the
+            # weekly review may not be due yet.  Keep these causes separate
+            # and explicit so a HOLD is not mistaken for an unexplained
+            # neutral recommendation.
+            entry_failure_reasons = []
+            if not item.review_due:
+                entry_failure_reasons.append("review_not_due")
+            if score < self.entry_percentile:
+                entry_failure_reasons.append("score_below_entry_percentile")
+            entry_failure_reasons.extend(
+                name for name, passed in gates.items()
+                if name != "review_due" and not bool(passed)
+            )
+            entry_failure_reasons = tuple(dict.fromkeys(entry_failure_reasons))
             entry = (
                 item.review_due
                 and score >= self.entry_percentile
@@ -340,6 +538,13 @@ class BankDailyMultifactorStrategy(CohortStrategy):
             exit_signal = item.risk_exit or item.trend_exit or (
                 item.review_due and score < self.exit_percentile
             )
+            exit_reasons = []
+            if item.risk_exit:
+                exit_reasons.append("risk_limit")
+            if item.trend_exit:
+                exit_reasons.append("trend_below_sma_60")
+            if item.review_due and score < self.exit_percentile:
+                exit_reasons.append("score_below_exit_percentile")
             # Daily risk exits override a coincident scheduled entry review.
             # This makes risk gating conservative without carrying positions
             # or hidden mutable state inside the strategy.
@@ -374,12 +579,33 @@ class BankDailyMultifactorStrategy(CohortStrategy):
                     reason=reason,
                     metadata={
                         "model_version": self.MODEL_VERSION,
+                        "model_variant": (
+                            "price_plus_fundamental_v1"
+                            if fundamental_overlay["enabled"]
+                            else "price_only_v1"
+                        ),
                         "bar_as_of": item.latest.timestamp.isoformat(),
                         "price_basis": self.PRICE_BASIS,
                         "cohort": context.cohort,
                         "universe_size": len(observations),
                         "rank": self._rank_from_top(scores, item.symbol),
                         "percentile": score,
+                        "price_score": price_scores[item.symbol],
+                        "fundamental_overlay": {
+                            "enabled": fundamental_overlay["enabled"],
+                            "status": fundamental_overlay["status"],
+                            "weight": self.fundamental_weight,
+                            "score": fundamental_score,
+                            "contribution": fundamental_contribution,
+                            "reason": fundamental_overlay["reason"],
+                            "decision_at": fundamental_overlay["decision_at"],
+                        },
+                        "score_thresholds": {
+                            "entry": self.entry_percentile,
+                            "exit": self.exit_percentile,
+                        },
+                        "factor_weights": factor_weights,
+                        "factor_contributions": factor_contributions,
                         "factors": {
                             "price_to_sma_120": item.price_to_sma_120,
                             "sma_20_to_60": item.sma_20_to_60,
@@ -391,6 +617,10 @@ class BankDailyMultifactorStrategy(CohortStrategy):
                         },
                         "factor_percentiles": ranks[item.symbol],
                         "gates": gates,
+                        "gate_failures": gate_failures,
+                        "entry_failure_reasons": entry_failure_reasons,
+                        "entry_eligible": entry,
+                        "exit_reasons": tuple(exit_reasons),
                         "breadth": breadth,
                         "risk_exit": item.risk_exit,
                         "trend_exit": item.trend_exit,
@@ -402,12 +632,33 @@ class BankDailyMultifactorStrategy(CohortStrategy):
             results.append(
                 {
                     "symbol": item.symbol,
+                    "model_variant": (
+                        "price_plus_fundamental_v1"
+                        if fundamental_overlay["enabled"]
+                        else "price_only_v1"
+                    ),
                     "bar_as_of": item.latest.timestamp.isoformat(),
                     "price": item.latest.close,
                     "score": score,
+                    "price_score": price_scores[item.symbol],
                     "rank": self._rank_from_top(scores, item.symbol),
                     "universe_size": len(observations),
                     "action": action.value,
+                    "score_thresholds": {
+                        "entry": self.entry_percentile,
+                        "exit": self.exit_percentile,
+                    },
+                    "factor_weights": factor_weights,
+                    "factor_contributions": factor_contributions,
+                    "fundamental_overlay": {
+                        "enabled": fundamental_overlay["enabled"],
+                        "status": fundamental_overlay["status"],
+                        "weight": self.fundamental_weight,
+                        "score": fundamental_score,
+                        "contribution": fundamental_contribution,
+                        "reason": fundamental_overlay["reason"],
+                        "decision_at": fundamental_overlay["decision_at"],
+                    },
                     "label": {
                         SignalAction.BUY: "偏强研究",
                         SignalAction.SELL: "偏弱研究",
@@ -425,6 +676,10 @@ class BankDailyMultifactorStrategy(CohortStrategy):
                     },
                     "factor_percentiles": ranks[item.symbol],
                     "gates": gates,
+                    "gate_failures": gate_failures,
+                    "entry_failure_reasons": entry_failure_reasons,
+                    "entry_eligible": entry,
+                    "exit_reasons": tuple(exit_reasons),
                     "breadth": breadth,
                     "risk_exit": item.risk_exit,
                     "trend_exit": item.trend_exit,
@@ -440,5 +695,12 @@ class BankDailyMultifactorStrategy(CohortStrategy):
             "required_universe": self.min_universe,
             "breadth": breadth,
             "excluded": excluded,
+            "fundamental_overlay": {
+                "enabled": fundamental_overlay["enabled"],
+                "status": fundamental_overlay["status"],
+                "weight": self.fundamental_weight,
+                "reason": fundamental_overlay["reason"],
+                "decision_at": fundamental_overlay["decision_at"],
+            },
             "items": tuple(results),
         }

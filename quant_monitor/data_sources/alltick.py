@@ -1949,24 +1949,38 @@ class AllTickMarketDataProvider(MarketDataProvider):
         self._reference_task = None
         depth_task = self._depth_task
         self._depth_task = None
-        if task is not None:
-            task.cancel()
+        async def cancel_task(candidate) -> None:
+            if candidate is None or candidate.done():
+                return
+            # Providers are sometimes constructed/started by an ASGI test
+            # loop and explicitly closed by a caller's loop (for example a
+            # synchronous shutdown hook).  Awaiting a Task owned by another
+            # loop raises RuntimeError and leaves shutdown looking hung.  Ask
+            # the owning loop to cancel it, but only await when ownership is
+            # local to this coroutine.
             try:
-                await task
+                owner_loop = candidate.get_loop()
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                owner_loop = None
+                current_loop = None
+            if owner_loop is not None and owner_loop is not current_loop:
+                if not owner_loop.is_closed():
+                    owner_loop.call_soon_threadsafe(candidate.cancel)
+                return
+            candidate.cancel()
+            try:
+                await candidate
             except asyncio.CancelledError:
                 pass
-        if reference_task is not None:
-            reference_task.cancel()
-            try:
-                await reference_task
-            except asyncio.CancelledError:
+            except Exception:
+                # Shutdown must remain idempotent even when a background
+                # reconnect/reference task failed just before cancellation.
                 pass
-        if depth_task is not None:
-            depth_task.cancel()
-            try:
-                await depth_task
-            except asyncio.CancelledError:
-                pass
+
+        await cancel_task(task)
+        await cancel_task(reference_task)
+        await cancel_task(depth_task)
         self._quotes.clear()
         self._quote_http_at.clear()
         self._quote_ws_at.clear()

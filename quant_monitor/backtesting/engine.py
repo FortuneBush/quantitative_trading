@@ -11,17 +11,23 @@ from __future__ import annotations
 
 import math
 import statistics
+import copy
+import hashlib
+import json
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from quant_monitor.domain import (
+    Adjustment,
+    AdjustmentFactor,
     Bar,
     Instrument,
     SHANGHAI_TZ,
     Signal,
     SignalAction,
+    ensure_market_time,
     normalize_symbol,
 )
 from quant_monitor.strategies import (
@@ -150,10 +156,64 @@ class BacktestEngine:
         trading_constraints: Iterable[TradingConstraint] = (),
         session_calendar: Optional[Sequence[Union[date, datetime]]] = None,
         trading_calendar: Optional[TradingCalendar] = None,
+        point_in_time_universe: Optional[object] = None,
+        universe_knowledge_cutoff: Optional[datetime] = None,
+        fundamental_factor_reports: Optional[
+            Mapping[Union[date, str], Mapping[str, object]]
+        ] = None,
+        adjustment_factors: Optional[Mapping[Tuple[str, date], AdjustmentFactor]] = None,
+        cancellation_check: Optional[Callable[[], None]] = None,
     ) -> BacktestResult:
-        bars, observed_sessions = self._prepare_bars(bars_by_symbol)
+        """Run the deterministic replay.
+
+        ``point_in_time_universe`` is an explicit research-only binding.  If
+        supplied it must be a :class:`UniverseSnapshot` (for a single-session
+        replay), a ``{session_date: UniverseSnapshot}`` mapping loaded from
+        immutable research storage, or a :class:`PointInTimeUniverse`
+        together with an explicit ``universe_knowledge_cutoff``.  Every
+        supplied bar is checked against the members effective on its own
+        session; bars for a future listing or a known delisted member fail
+        closed instead of being silently used.
+        The argument is optional for backwards compatibility with ordinary
+        exploratory backtests, but strict research callers should always
+        provide it.
+
+        ``cancellation_check`` is an optional cooperative lifecycle hook. It
+        may raise to stop before preparation, at session boundaries and after
+        strategy evaluation. It is never supplied to a strategy and does not
+        change any successful replay's financial output.
+        """
+        if cancellation_check is not None and not callable(cancellation_check):
+            raise TypeError("cancellation_check must be callable")
+        checkpoint = cancellation_check if cancellation_check is not None else (lambda: None)
+        checkpoint()
+        factors = self._prepare_adjustment_factors(adjustment_factors)
+        # Keep the raw, unadjusted observations as the authoritative execution
+        # and valuation stream.  An adjusted projection is built separately
+        # for strategy context only; otherwise a split/dividend factor would
+        # change simulated fills, cash, position sizing and NAV.
+        bars, observed_sessions, strategy_bars = self._prepare_bars(
+            bars_by_symbol, factors
+        )
+        universe_binding = self._validate_point_in_time_universe(
+            bars,
+            observed_sessions,
+            point_in_time_universe,
+            universe_knowledge_cutoff,
+            decision_wall_time=self.config.daily_evaluation_time,
+        )
+        calendar_fingerprint = (
+            getattr(trading_calendar, "fingerprint", None)
+            if trading_calendar is not None
+            else None
+        )
         sessions, calendar_metadata = self._prepare_calendar(
             session_calendar, observed_sessions, trading_calendar
+        )
+        normalized_fundamental_reports = self._prepare_fundamental_reports(
+            fundamental_factor_reports,
+            sessions,
+            evaluation_time=self.config.daily_evaluation_time,
         )
         constraints = self._prepare_constraints(trading_constraints)
         self._validate_constraint_scope(constraints, bars, sessions)
@@ -167,6 +227,7 @@ class BacktestEngine:
         seen_signal_keys: Set[Tuple[str, str, str, object]] = set()
 
         for session in sessions:
+            checkpoint()
             current = {
                 symbol: symbol_bars[session]
                 for symbol, symbol_bars in bars.items()
@@ -191,11 +252,41 @@ class BacktestEngine:
                 last_prices[symbol] = bar.close
                 if symbol in holdings:
                     holdings[symbol].last_price = bar.close
+            # A held position must have a valuation observation on every
+            # equity session.  Reusing the previous close when a symbol has
+            # no bar would silently create a stale mark-to-market value and
+            # understate both return and risk.  The research contract is
+            # fail-closed: callers must provide an explicit valuation bar (or
+            # end the holding before the gap) rather than letting an old
+            # price drift through the equity curve.
+            missing_valuation_symbols = sorted(
+                symbol
+                for symbol, holding in holdings.items()
+                if holding.quantity > 0 and symbol not in current
+            )
+            if missing_valuation_symbols:
+                raise BacktestValidationError(
+                    "missing valuation bar for held symbol(s) on {}: {}".format(
+                        session.isoformat(), ", ".join(missing_valuation_symbols)
+                    )
+                )
             evaluation_timestamp = self._session_timestamp(
                 session, self.config.daily_evaluation_time
             )
             equity.append(self._equity_point(evaluation_timestamp, cash, holdings, equity))
-            emitted = self._evaluate(session, evaluation_timestamp, bars, current)
+            strategy_current = {
+                symbol: symbol_bars[session]
+                for symbol, symbol_bars in strategy_bars.items()
+                if session in symbol_bars
+            }
+            emitted = self._evaluate(
+                session,
+                evaluation_timestamp,
+                strategy_bars,
+                strategy_current,
+                fundamental_factor_report=normalized_fundamental_reports.get(session),
+            )
+            checkpoint()
             new_pending = self._validate_signals(
                 emitted, evaluation_timestamp, seen_signal_keys
             )
@@ -206,6 +297,7 @@ class BacktestEngine:
                 if item.signal.symbol not in replacement_symbols
             ) + tuple(new_pending)
 
+        checkpoint()
         for item in pending:
             skipped.append(
                 SkippedExecution(
@@ -226,6 +318,12 @@ class BacktestEngine:
             constraints=constraints,
             trades=trades,
             skipped=skipped,
+            universe_binding=universe_binding,
+            adjustment_binding=self._adjustment_binding(factors),
+            calendar_fingerprint=calendar_fingerprint,
+            fundamental_binding=self._fundamental_binding(
+                normalized_fundamental_reports, sessions
+            ),
         )
         return BacktestResult(
             strategy_name=self.strategy.name,
@@ -240,16 +338,193 @@ class BacktestEngine:
             diagnostics=diagnostics,
         )
 
+    @staticmethod
+    def _validate_point_in_time_universe(
+        bars: Mapping[str, Mapping[date, Bar]],
+        observed_sessions: Sequence[date],
+        point_in_time_universe: Optional[object],
+        knowledge_cutoff: Optional[datetime],
+        *,
+        decision_wall_time: time = time(15, 30),
+    ) -> Optional[Mapping[str, object]]:
+        """Validate and describe a supplied PIT universe without I/O.
+
+        Imports are intentionally local: the research package imports the
+        backtest engine for independent replay, so importing its domain types
+        at module import time would create a cycle.  An arbitrary duck-typed
+        object is not accepted at this security boundary.
+        """
+        if point_in_time_universe is None:
+            if knowledge_cutoff is not None:
+                raise BacktestValidationError(
+                    "universe_knowledge_cutoff requires point_in_time_universe"
+                )
+            return None
+        from quant_monitor.research.universe import PointInTimeUniverse, UniverseSnapshot
+
+        if isinstance(point_in_time_universe, UniverseSnapshot):
+            if knowledge_cutoff is not None:
+                raise BacktestValidationError(
+                    "universe_knowledge_cutoff is not used with a UniverseSnapshot"
+                )
+            if len(set(observed_sessions)) != 1 or observed_sessions[0] != point_in_time_universe.session_date:
+                raise BacktestValidationError(
+                    "a UniverseSnapshot can only bind bars from its single session"
+                )
+            by_session = {point_in_time_universe.session_date: point_in_time_universe}
+        elif isinstance(point_in_time_universe, PointInTimeUniverse):
+            if knowledge_cutoff is None:
+                raise BacktestValidationError(
+                    "universe_knowledge_cutoff is required for PointInTimeUniverse"
+                )
+            # A single cutoff is shared by every session in this replay.  It
+            # must not be later than the first decision timestamp: otherwise
+            # a classification/listing revision learned after the historical
+            # trade could leak into the earlier universe.  The resolver itself
+            # intentionally supports arbitrary as-of queries for research
+            # inspection; this stricter guard belongs at the backtest boundary
+            # where the decision-time semantics are known.
+            normalized_cutoff = ensure_market_time(knowledge_cutoff)
+            if not isinstance(decision_wall_time, time):
+                raise TypeError("decision_wall_time must be a datetime.time")
+            if decision_wall_time.tzinfo is not None and decision_wall_time.utcoffset() is not None:
+                raise ValueError("decision_wall_time must be timezone-naive Shanghai wall time")
+            if observed_sessions:
+                earliest_decision = datetime.combine(
+                    min(observed_sessions),
+                    decision_wall_time.replace(tzinfo=None),
+                    tzinfo=SHANGHAI_TZ,
+                )
+                if normalized_cutoff > earliest_decision:
+                    raise BacktestValidationError(
+                        "universe_knowledge_cutoff cannot be after the earliest "
+                        "backtest decision timestamp"
+                    )
+            by_session = {}
+            try:
+                for session in observed_sessions:
+                    members = point_in_time_universe.members_at(session, knowledge_cutoff)
+                    symbols = tuple(item.symbol for item in members)
+                    if len(set(symbols)) != len(symbols):
+                        raise BacktestValidationError(
+                            "point-in-time universe contains duplicate symbols"
+                        )
+                    # Resolve a content-addressed snapshot for the exact
+                    # session/cutoff.  This also checks temporal eligibility.
+                    by_session[session] = point_in_time_universe.snapshot_from_members(
+                        session, knowledge_cutoff, members
+                    )
+            except BacktestValidationError:
+                raise
+            except Exception as exc:
+                raise BacktestValidationError(
+                    "point-in-time universe resolution failed: {}".format(type(exc).__name__)
+                ) from None
+        elif isinstance(point_in_time_universe, Mapping):
+            # A persisted repository cannot safely be reconstructed as a
+            # resolver: doing so could apply one revision to every session.
+            # Require an explicit, immutable snapshot for each observed
+            # session and validate the mapping key against the snapshot's own
+            # session date.  ``universe_knowledge_cutoff`` is intentionally
+            # rejected because each persisted row already carries its own
+            # cutoff; silently overriding it would detach the evidence.
+            if knowledge_cutoff is not None:
+                raise BacktestValidationError(
+                    "universe_knowledge_cutoff is not used with persisted snapshot mappings"
+                )
+            by_session = {}
+            for raw_session, snapshot in point_in_time_universe.items():
+                if isinstance(raw_session, datetime):
+                    raise BacktestValidationError("persisted universe snapshot session key is invalid")
+                if isinstance(raw_session, date):
+                    session = raw_session
+                elif isinstance(raw_session, str):
+                    try:
+                        session = date.fromisoformat(raw_session)
+                    except (TypeError, ValueError):
+                        raise BacktestValidationError(
+                            "persisted universe snapshot session key is invalid"
+                        ) from None
+                else:
+                    raise BacktestValidationError(
+                        "persisted universe snapshot session key is invalid"
+                    )
+                if not isinstance(snapshot, UniverseSnapshot) or snapshot.session_date != session:
+                    raise BacktestValidationError(
+                        "persisted universe snapshot does not match its session key"
+                    )
+                if not isinstance(decision_wall_time, time):
+                    raise TypeError("decision_wall_time must be a datetime.time")
+                if decision_wall_time.tzinfo is not None and decision_wall_time.utcoffset() is not None:
+                    raise ValueError("decision_wall_time must be a timezone-naive Shanghai wall time")
+                decision_at = datetime.combine(
+                    session,
+                    decision_wall_time.replace(tzinfo=None),
+                    tzinfo=SHANGHAI_TZ,
+                )
+                if snapshot.knowledge_cutoff > decision_at:
+                    raise BacktestValidationError(
+                        "persisted universe snapshot knowledge_cutoff cannot be after "
+                        "the session decision timestamp"
+                    )
+                prior = by_session.get(session)
+                if prior is not None and prior.content_hash != snapshot.content_hash:
+                    raise BacktestValidationError(
+                        "conflicting persisted universe snapshots for {}".format(session.isoformat())
+                    )
+                by_session[session] = snapshot
+            if set(by_session) != set(observed_sessions):
+                raise BacktestValidationError(
+                    "persisted universe snapshots must cover every observed session"
+                )
+        else:
+            raise BacktestValidationError(
+                "point_in_time_universe must be a UniverseSnapshot, snapshot mapping, or PointInTimeUniverse"
+            )
+
+        for symbol, symbol_bars in bars.items():
+            for session in symbol_bars:
+                snapshot = by_session.get(session)
+                if snapshot is None or symbol not in snapshot.symbols:
+                    raise BacktestValidationError(
+                        "bar symbol {} is outside point-in-time universe on {}".format(
+                            symbol, session.isoformat()
+                        )
+                    )
+        versions = {snapshot.version for snapshot in by_session.values()}
+        hashes = {snapshot.content_hash for snapshot in by_session.values()}
+        # Keep the result hash bound to the exact resolved snapshots.  The
+        # complete per-session mapping is deterministic and contains no
+        # credentials or provider payloads.
+        cutoffs = {snapshot.knowledge_cutoff.isoformat() for snapshot in by_session.values()}
+        return {
+            "mode": "point_in_time",
+            "version": next(iter(versions)) if len(versions) == 1 else "mixed",
+            "snapshot_hashes": tuple(sorted(hashes)),
+            "knowledge_cutoff": (
+                knowledge_cutoff.isoformat() if knowledge_cutoff is not None
+                else next(iter(cutoffs)) if len(cutoffs) == 1 else "mixed"
+            ),
+        }
+
     def _prepare_bars(
-        self, bars_by_symbol: Mapping[str, Sequence[Bar]]
-    ) -> Tuple[Dict[str, Dict[date, Bar]], Tuple[date, ...]]:
+        self,
+        bars_by_symbol: Mapping[str, Sequence[Bar]],
+        adjustment_factors: Mapping[Tuple[str, date], AdjustmentFactor],
+    ) -> Tuple[
+        Dict[str, Dict[date, Bar]],
+        Tuple[date, ...],
+        Dict[str, Dict[date, Bar]],
+    ]:
         normalized: Dict[str, Dict[date, Bar]] = {}
+        strategy_projection: Dict[str, Dict[date, Bar]] = {}
         all_sessions: Set[date] = set()
         for raw_symbol, raw_bars in dict(bars_by_symbol or {}).items():
             symbol = normalize_symbol(raw_symbol)
             if symbol in normalized:
                 raise BacktestValidationError("duplicate normalized symbol: {}".format(symbol))
             by_session: Dict[date, Bar] = {}
+            strategy_by_session: Dict[date, Bar] = {}
             previous_timestamp: Optional[datetime] = None
             for bar in raw_bars:
                 if not isinstance(bar, Bar):
@@ -279,12 +554,258 @@ class BacktestEngine:
                     raise BacktestValidationError(
                         "multiple daily bars for {} on {}".format(symbol, session.isoformat())
                     )
+                basis = self._price_basis_adjustment()
+                source_parts = bar.source.rsplit("|", 2)
+                marked_adjusted = len(source_parts) == 3 and source_parts[1] in {
+                    item.value for item in Adjustment
+                }
+                strategy_bar = bar
+                if basis == Adjustment.RAW:
+                    if adjustment_factors:
+                        raise BacktestValidationError(
+                            "adjustment_factors cannot be supplied for raw_unadjusted backtests"
+                        )
+                    if marked_adjusted:
+                        raise BacktestValidationError(
+                            "raw_unadjusted backtest received a materialized adjusted bar"
+                        )
+                else:
+                    factor = adjustment_factors.get((symbol, session))
+                    if factor is None:
+                        raise BacktestValidationError(
+                            "{} backtest requires an adjustment factor for {} on {}".format(
+                                self.config.price_basis, symbol, session.isoformat()
+                            )
+                        )
+                    if factor.adjustment != basis:
+                        raise BacktestValidationError(
+                            "adjustment factor basis does not match backtest price_basis"
+                        )
+                    if marked_adjusted:
+                        raise BacktestValidationError(
+                            "adjusted backtest received a materialized adjusted input bar"
+                        )
+                    strategy_bar = factor.apply_bar(bar).to_bar()
                 by_session[session] = bar
+                strategy_by_session[session] = strategy_bar
                 all_sessions.add(session)
             normalized[symbol] = by_session
+            strategy_projection[symbol] = strategy_by_session
         if not all_sessions:
             raise BacktestValidationError("at least one daily bar is required")
-        return normalized, tuple(sorted(all_sessions))
+        if adjustment_factors:
+            expected_factor_keys = {
+                (symbol, session)
+                for symbol, symbol_bars in normalized.items()
+                for session in symbol_bars
+            }
+            extra_factor_keys = set(adjustment_factors) - expected_factor_keys
+            if extra_factor_keys:
+                symbol, session = sorted(extra_factor_keys, key=lambda item: (item[0], item[1]))[0]
+                raise BacktestValidationError(
+                    "adjustment factor {} on {} is outside the supplied bars".format(
+                        symbol, session.isoformat()
+                    )
+                )
+        return normalized, tuple(sorted(all_sessions)), strategy_projection
+
+    def _price_basis_adjustment(self) -> Adjustment:
+        value = self.config.price_basis.strip().lower()
+        if value == "raw_unadjusted" or value == Adjustment.RAW.value:
+            return Adjustment.RAW
+        if value == Adjustment.QFQ.value or value.startswith("qfq_"):
+            return Adjustment.QFQ
+        if value == Adjustment.HFQ.value or value.startswith("hfq_"):
+            return Adjustment.HFQ
+        raise BacktestValidationError(
+            "unsupported price_basis {}; use raw_unadjusted, qfq or hfq".format(
+                self.config.price_basis
+            )
+        )
+
+    @staticmethod
+    def _prepare_adjustment_factors(
+        values: Optional[Mapping[Tuple[str, date], AdjustmentFactor]],
+    ) -> Dict[Tuple[str, date], AdjustmentFactor]:
+        if values is None:
+            return {}
+        result: Dict[Tuple[str, date], AdjustmentFactor] = {}
+        for raw_key, factor in dict(values).items():
+            if not isinstance(raw_key, tuple) or len(raw_key) != 2:
+                raise BacktestValidationError(
+                    "adjustment factor keys must be (symbol, session_date) tuples"
+                )
+            symbol = normalize_symbol(raw_key[0])
+            session = raw_key[1]
+            if not isinstance(session, date) or isinstance(session, datetime):
+                raise BacktestValidationError("adjustment factor key date is invalid")
+            if not isinstance(factor, AdjustmentFactor):
+                raise TypeError("adjustment_factors values must be AdjustmentFactor instances")
+            if factor.symbol != symbol or factor.session_date != session:
+                raise BacktestValidationError(
+                    "adjustment factor key does not match factor identity"
+                )
+            key = (symbol, session)
+            if key in result:
+                raise BacktestValidationError("duplicate adjustment factor")
+            result[key] = factor
+        return result
+
+    @staticmethod
+    def _prepare_fundamental_reports(
+        reports: Optional[Mapping[Union[date, str], Mapping[str, object]]],
+        sessions: Sequence[date],
+        *,
+        evaluation_time: time,
+    ) -> Dict[date, Mapping[str, object]]:
+        """Validate caller-supplied PIT factor reports for replay.
+
+        The backtest kernel deliberately does not query SQLite or a provider.
+        A research caller may nevertheless bind one already materialised
+        factor report to each session.  Keys are explicit session dates and
+        reports are copied before entering strategy metadata so a strategy
+        cannot mutate the caller's evidence.  Completeness and metric-level
+        validation remain the responsibility of the strategy's pure overlay
+        contract; this boundary enforces only temporal and shape invariants.
+        """
+        if reports is None:
+            return {}
+        if not isinstance(reports, Mapping):
+            raise TypeError("fundamental_factor_reports must be a mapping")
+        session_set = set(sessions)
+        normalized: Dict[date, Mapping[str, object]] = {}
+        for raw_session, raw_report in reports.items():
+            if isinstance(raw_session, datetime):
+                raise BacktestValidationError(
+                    "fundamental factor report session key must be a date"
+                )
+            if isinstance(raw_session, date):
+                session = raw_session
+            elif isinstance(raw_session, str):
+                try:
+                    session = date.fromisoformat(raw_session)
+                except (TypeError, ValueError):
+                    raise BacktestValidationError(
+                        "fundamental factor report session key is invalid"
+                    ) from None
+            else:
+                raise BacktestValidationError(
+                    "fundamental factor report session key is invalid"
+                )
+            if session not in session_set:
+                raise BacktestValidationError(
+                    "fundamental factor report session is outside backtest calendar: {}".format(
+                        session.isoformat()
+                    )
+                )
+            if session in normalized:
+                raise BacktestValidationError(
+                    "duplicate fundamental factor report session: {}".format(
+                        session.isoformat()
+                    )
+                )
+            if not isinstance(raw_report, Mapping):
+                raise BacktestValidationError(
+                    "fundamental factor report must be an object"
+                )
+            if raw_report.get("selection") != "bank_fundamental_factors_as_of_v1":
+                raise BacktestValidationError(
+                    "fundamental factor report selection is unsupported"
+                )
+            try:
+                decision_at = ensure_market_time(
+                    datetime.fromisoformat(str(raw_report["decision_at"]))
+                )
+            except (KeyError, TypeError, ValueError):
+                raise BacktestValidationError(
+                    "fundamental factor report decision_at is invalid"
+                ) from None
+            decision_timestamp = datetime.combine(
+                session,
+                evaluation_time.replace(tzinfo=None),
+                tzinfo=SHANGHAI_TZ,
+            )
+            if decision_at > decision_timestamp:
+                raise BacktestValidationError(
+                    "fundamental factor report is after its backtest decision time"
+                )
+            # A detached nested list/dict could otherwise be changed after
+            # validation and alter future strategy decisions.  deepcopy keeps
+            # the pure strategy boundary independent of the caller object.
+            try:
+                detached = copy.deepcopy(dict(raw_report))
+            except Exception as exc:
+                raise BacktestValidationError(
+                    "fundamental factor report is not safely copyable: {}".format(
+                        type(exc).__name__
+                    )
+                ) from None
+            try:
+                # Keep a content address in the result diagnostics.  The
+                # digest is deliberately computed over canonical JSON only;
+                # it is an integrity locator, not a claim that the source is
+                # independently authenticated.
+                BacktestEngine._fundamental_report_hash(detached)
+            except (TypeError, ValueError, OverflowError):
+                raise BacktestValidationError(
+                    "fundamental factor report must be JSON-serializable"
+                ) from None
+            normalized[session] = detached
+        return normalized
+
+    @staticmethod
+    def _fundamental_report_hash(report: Mapping[str, object]) -> str:
+        try:
+            encoded = json.dumps(
+                report,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError):
+            raise
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _fundamental_binding(
+        reports: Mapping[date, Mapping[str, object]], sessions: Sequence[date]
+    ) -> Mapping[str, object]:
+        if not reports:
+            return {"status": "not_bound", "report_count": 0, "session_count": len(sessions)}
+        provided = tuple(sorted(item.isoformat() for item in reports))
+        missing = tuple(
+            sorted(item.isoformat() for item in sessions if item not in reports)
+        )
+        return {
+            "status": "bound_unattested",
+            "report_count": len(reports),
+            "session_count": len(sessions),
+            "provided_sessions": provided,
+            "missing_sessions": missing,
+            "complete": not missing,
+            "hash_algorithm": "sha256-json-v1",
+            "report_hashes": {
+                item.isoformat(): BacktestEngine._fundamental_report_hash(reports[item])
+                for item in sorted(reports)
+            },
+        }
+
+    @staticmethod
+    def _adjustment_binding(
+        factors: Mapping[Tuple[str, date], AdjustmentFactor],
+    ) -> Mapping[str, object]:
+        if not factors:
+            return {"status": "not_bound", "factor_count": 0, "factor_versions": ()}
+        versions = tuple(sorted({item.factor_version for item in factors.values()}))
+        revisions = tuple(sorted({item.revision_id for item in factors.values()}))
+        return {
+            "status": "bound_unattested",
+            "factor_count": len(factors),
+            "factor_versions": versions,
+            "revision_ids": revisions,
+            "factor_ids": tuple(sorted(item.factor_id for item in factors.values())),
+        }
 
     @staticmethod
     def _prepare_calendar(
@@ -343,7 +864,16 @@ class BacktestEngine:
                 raise BacktestValidationError(
                     "trading_calendar returned sessions outside the requested range"
                 )
-            missing = [item for item in observed_sessions if item not in set(sessions)]
+            session_set = set(sessions)
+            # A caller may include leading history bars solely to warm up a
+            # stateful/rolling strategy.  They are context, never execution
+            # sessions.  Bars after the requested range remain a future-data
+            # violation and are rejected.
+            missing = [
+                item
+                for item in observed_sessions
+                if item not in session_set and item >= sessions[0]
+            ]
             if missing:
                 raise BacktestValidationError(
                     "trading_calendar omits observed bar session {}".format(
@@ -364,6 +894,20 @@ class BacktestEngine:
                 ) from None
             return sessions, metadata
         if calendar is None:
+            # Never infer an exchange session from an observed weekend row.
+            # Callers with an exchange-specific makeup session or holiday
+            # schedule must supply an explicit TradingCalendar snapshot.
+            off_weekday = [
+                item for item in observed_sessions
+                if not DEFAULT_TRADING_CALENDAR.is_session(item)
+            ]
+            if off_weekday:
+                raise BacktestValidationError(
+                    "observed bar session {} is not a weekday session; ".format(
+                        off_weekday[0].isoformat()
+                    )
+                    + "supply an explicit trading_calendar for exchange exceptions"
+                )
             metadata = DEFAULT_TRADING_CALENDAR.metadata
             return observed_sessions, CalendarMetadata(
                 identifier="observed_sessions_fallback",
@@ -391,7 +935,11 @@ class BacktestEngine:
                 "session_calendar must be strictly increasing and unique"
             )
         session_set = set(sessions)
-        missing = [item for item in observed_sessions if item not in session_set]
+        missing = [
+            item
+            for item in observed_sessions
+            if item not in session_set and item >= sessions[0]
+        ]
         if missing:
             raise BacktestValidationError(
                 "session_calendar omits observed bar session {}".format(missing[0].isoformat())
@@ -453,6 +1001,8 @@ class BacktestEngine:
         timestamp: datetime,
         bars: Mapping[str, Mapping[date, Bar]],
         current: Mapping[str, Bar],
+        *,
+        fundamental_factor_report: Optional[Mapping[str, object]] = None,
     ) -> Sequence[Signal]:
         if isinstance(self.strategy, Strategy):
             signals: List[Signal] = []
@@ -495,6 +1045,10 @@ class BacktestEngine:
                 "backtest": True,
                 "expected_bar_date": session.isoformat(),
                 "price_basis": self.config.price_basis,
+                # This is an explicit, caller-supplied PIT report.  It is
+                # absent when no report was bound, preserving price-only
+                # behaviour for ordinary exploratory backtests.
+                "fundamental_factor_report": fundamental_factor_report,
             },
         )
         produced = self.strategy.evaluate(context)
@@ -656,6 +1210,10 @@ class BacktestEngine:
             return constraint.reason
         if reason == "explicit_suspended":
             return "explicit trading constraint marked the security suspended"
+        if reason == "limit_up_locked":
+            return "effective buy price reached or exceeded supplied limit_up_price"
+        if reason == "limit_down_locked":
+            return "effective sell price reached or fell below supplied limit_down_price"
         if reason == "zero_volume_execution_bar":
             return "the supplied execution bar had zero volume; suspension is not inferred"
         return "explicit trading constraint or zero-volume bar prevented execution"
@@ -706,6 +1264,29 @@ class BacktestEngine:
             return "zero_volume_execution_bar"
         if bar.open <= 0:
             return "invalid_execution_price"
+        # A-share limit-lock state is supplied point-in-time by the caller;
+        # never infer the percentage from a symbol prefix or previous close.
+        # Compare the effective order price after configured slippage and tick
+        # rounding so a fill cannot cross an exchange boundary merely because
+        # execution assumptions were optimistic.
+        if constraint is not None:
+            tick = self._price_tick(signal.symbol)
+            if signal.action == SignalAction.BUY and constraint.limit_up_price is not None:
+                effective = self._price(
+                    bar.open * (Decimal("1") + self.config.buy_slippage_rate),
+                    tick,
+                    side=SignalAction.BUY,
+                )
+                if effective >= constraint.limit_up_price:
+                    return "limit_up_locked"
+            if signal.action == SignalAction.SELL and constraint.limit_down_price is not None:
+                effective = self._price(
+                    bar.open * (Decimal("1") - self.config.sell_slippage_rate),
+                    tick,
+                    side=SignalAction.SELL,
+                )
+                if effective <= constraint.limit_down_price:
+                    return "limit_down_locked"
         return None
 
     def _buy(
@@ -819,7 +1400,8 @@ class BacktestEngine:
         commission = self._commission(gross, self.config.sell_commission_rate)
         stamp_duty = self._money(gross * self.config.stamp_duty_rate)
         cash = self._money(cash + gross - commission - stamp_duty)
-        holding.remove_settled(quantity, session)
+        removed_cost = holding.remove_settled(quantity, session)
+        realized_pnl = self._money(gross - commission - stamp_duty - removed_cost)
         if holding.quantity == 0:
             del holdings[signal.symbol]
         slippage = self._money((bar.open - price) * Decimal(quantity))
@@ -838,6 +1420,7 @@ class BacktestEngine:
                 slippage_cost=slippage,
                 cash_after=cash,
                 tradeability_verified=(signal.symbol, session) in constraints,
+                realized_pnl=realized_pnl,
             )
         )
         return cash, None
@@ -919,18 +1502,54 @@ class BacktestEngine:
         constraints: Mapping[Tuple[str, date], TradingConstraint],
         trades: Sequence[Trade],
         skipped: Sequence[SkippedExecution],
+        universe_binding: Optional[Mapping[str, object]] = None,
+        adjustment_binding: Optional[Mapping[str, object]] = None,
+        calendar_fingerprint: Optional[str] = None,
+        fundamental_binding: Optional[Mapping[str, object]] = None,
     ) -> BacktestDiagnostics:
-        possible_constraint_points = len(bars) * len(sessions)
+        # A constraint is only meaningful for a symbol/session where an
+        # execution bar actually exists.  Using ``len(bars) * len(sessions)``
+        # here treats a symbol with a legitimately missing bar (for example a
+        # sparse listing or a data gap) as if it had an executable session and
+        # consequently understates coverage.  Keep the denominator aligned
+        # with the engine's execution universe instead of penalising callers
+        # for sessions that could never have produced a fill.
+        session_set = set(sessions)
+        possible_constraint_points = sum(
+            1 for symbol_bars in bars.values() if symbol_bars
+            for session in symbol_bars if session in session_set
+        )
         constrained_points = sum(
             1
             for symbol, session in constraints
-            if symbol in bars and session in set(sessions)
+            # A constraint only covers an executable data point when this
+            # symbol actually has an execution bar for the session.  A
+            # caller may legitimately provide a calendar-wide constraint
+            # snapshot that includes suspended/missing-bar dates; counting
+            # those rows in the numerator would make it exceed the
+            # denominator (and could even fail diagnostics validation with a
+            # coverage greater than one).
+            if symbol in bars
+            and session in session_set
+            and session in bars[symbol]
         )
         coverage = (
             constrained_points / possible_constraint_points
             if possible_constraint_points
             else 0.0
         )
+        # Preserve the actual source identity of the bars consumed by this
+        # replay.  Capacity/lineage reports must not infer it from the
+        # currently configured provider: a provider switch after a result was
+        # persisted would otherwise silently audit a different dataset (or
+        # report every trade as unassessed).  Multiple sources remain visible
+        # and are handled conservatively by downstream readers.
+        bar_sources = tuple(sorted({
+            str(bar.source).strip()
+            for symbol_bars in bars.values()
+            for bar in symbol_bars.values()
+            if str(bar.source).strip()
+        }))
         unverified = sum(not item.tradeability_verified for item in trades)
         warnings: List[str] = []
         if calendar_metadata.identifier in {
@@ -976,14 +1595,37 @@ class BacktestEngine:
             unverified_fill_count=unverified,
             assumptions={
                 "signal_execution": "next_session_open_with_bounded_validity",
+                "strategy_price_basis": self.config.price_basis,
+                # These are deliberately fixed even when strategy_price_basis
+                # is qfq/hfq.  Corporate-action factors are a signal input,
+                # not a substitute for raw market prices in accounting.
+                "execution_price_basis": "raw_unadjusted",
+                "valuation_price_basis": "raw_unadjusted",
                 "missing_execution_bar": "unknown_availability_not_suspension",
                 "unconstrained_positive_volume_bar": "fill_allowed_but_tradeability_unverified",
                 "portfolio_mapping": "sell_first_equal_cash_split_no_pyramiding",
+                "bar_sources": bar_sources,
                 "calendar_source": calendar_metadata.identifier,
+                "calendar_fingerprint": calendar_fingerprint,
                 "calendar_lineage": (
                     "unverified"
                 ),
                 "corporate_action_lineage": "unverified",
+                "adjustment_factor_binding": (
+                    dict(adjustment_binding)
+                    if adjustment_binding is not None
+                    else {"status": "not_bound", "factor_count": 0, "factor_versions": ()}
+                ),
+                "fundamental_factor_binding": (
+                    dict(fundamental_binding)
+                    if fundamental_binding is not None
+                    else {"status": "not_bound", "report_count": 0}
+                ),
+                "universe_binding": (
+                    dict(universe_binding)
+                    if universe_binding is not None
+                    else "not_bound"
+                ),
             },
             warnings=tuple(warnings),
             decision_grade=decision_grade,
@@ -1000,12 +1642,12 @@ class BacktestEngine:
         else:
             annualized_return = total_return
         daily_returns = [item.daily_return for item in equity[1:]]
+        daily_risk_free = float(self.config.annual_risk_free_rate) / float(
+            self.config.annualization_sessions
+        )
         if len(daily_returns) >= 2:
             daily_volatility = statistics.stdev(daily_returns)
             annualized_volatility = daily_volatility * math.sqrt(
-                self.config.annualization_sessions
-            )
-            daily_risk_free = float(self.config.annual_risk_free_rate) / float(
                 self.config.annualization_sessions
             )
             sharpe = (
@@ -1019,9 +1661,61 @@ class BacktestEngine:
             annualized_volatility = 0.0
             sharpe = 0.0
         maximum_drawdown = max((-item.drawdown for item in equity), default=0.0)
+        excess_returns = [item - daily_risk_free for item in daily_returns]
+        downside_squared = [min(item, 0.0) ** 2 for item in excess_returns]
+        downside_deviation = (
+            math.sqrt(statistics.fmean(downside_squared))
+            * math.sqrt(self.config.annualization_sessions)
+            if downside_squared
+            else 0.0
+        )
+        sortino = (
+            # Sortino's numerator is the arithmetic mean excess return,
+            # annualized over the configured number of sessions.  Using the
+            # CAGR here (as the old implementation did) mixes geometric and
+            # arithmetic conventions and can materially over/understate the
+            # ratio for volatile or short samples.
+            (statistics.fmean(excess_returns) * self.config.annualization_sessions)
+            / downside_deviation
+            if downside_deviation > 0
+            else 0.0
+        )
+        calmar = annualized_return / maximum_drawdown if maximum_drawdown > 0 else 0.0
+        positive_session_ratio = (
+            sum(item > 0 for item in daily_returns) / len(daily_returns)
+            if daily_returns
+            else 0.0
+        )
+        max_drawdown_duration = 0
+        current_drawdown_duration = 0
+        for point in equity:
+            if point.drawdown < 0:
+                current_drawdown_duration += 1
+                max_drawdown_duration = max(
+                    max_drawdown_duration, current_drawdown_duration
+                )
+            else:
+                current_drawdown_duration = 0
         average_nav = sum((item.nav for item in equity), Decimal("0")) / Decimal(len(equity))
         traded_notional = sum((item.gross_notional for item in trades), Decimal("0"))
         turnover = float(traded_notional / average_nav) if average_nav > 0 else 0.0
+        if any(item.action == SignalAction.SELL and item.realized_pnl is None for item in trades):
+            raise ValueError("closing sell is missing realized_pnl")
+        realized = tuple(
+            item.realized_pnl
+            for item in trades
+            if item.action == SignalAction.SELL and item.realized_pnl is not None
+        )
+        winning = sum(value > 0 for value in realized)
+        losing = sum(value < 0 for value in realized)
+        break_even = sum(value == 0 for value in realized)
+        closed = len(realized)
+        gross_profit = sum((value for value in realized if value > 0), Decimal("0"))
+        gross_loss = sum((-value for value in realized if value < 0), Decimal("0"))
+        realized_pnl = sum(realized, Decimal("0"))
+        win_rate = winning / closed if closed else None
+        profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else None
+        expectancy = realized_pnl / Decimal(closed) if closed else None
         return BacktestMetrics(
             starting_nav=starting,
             ending_nav=ending,
@@ -1036,4 +1730,22 @@ class BacktestEngine:
             total_slippage_cost=sum((item.slippage_cost for item in trades), Decimal("0")),
             session_count=len(equity),
             trade_count=len(trades),
+            sortino_ratio=sortino,
+            calmar_ratio=calmar,
+            positive_session_ratio=positive_session_ratio,
+            maximum_drawdown_duration_sessions=max_drawdown_duration,
+            closed_trade_count=closed,
+            winning_trade_count=winning,
+            losing_trade_count=losing,
+            break_even_trade_count=break_even,
+            win_rate=win_rate,
+            gross_profit=gross_profit,
+            gross_loss=gross_loss,
+            realized_pnl=realized_pnl,
+            profit_factor=profit_factor,
+            expectancy_per_closed_trade=expectancy,
+            trade_statistics_status="available" if closed else "no_closed_trades",
+            profit_factor_status=(
+                "available" if gross_loss > 0 else "no_losses" if closed else "no_closed_trades"
+            ),
         )

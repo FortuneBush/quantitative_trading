@@ -5,6 +5,8 @@ from .collection import (
     CollectionResult,
     MarketDataCollectionService,
     MarketDataCollector,
+    QuoteCollectionResult,
+    QuoteSnapshotError,
 )
 from .event_bus import EventBus, EventHandler, Subscription
 from .analysis import AnalysisSnapshot, QuantitativeAnalysisService
@@ -14,11 +16,12 @@ from .data_quality import (
     SymbolDailyQuality,
 )
 from .indicators import IndicatorCalculator
-from .monitoring import MonitoringCycleResult, MonitoringService
+from .monitoring import CollectionJobSnapshot, MonitoringCycleResult, MonitoringService
 
 __all__ = [
     "CollectionResult",
     "BarCollectionResult",
+    "CollectionJobSnapshot",
     "AnalysisSnapshot",
     "DailyBarDataQualityService",
     "DailyDataQualitySummary",
@@ -27,6 +30,8 @@ __all__ = [
     "IndicatorCalculator",
     "MarketDataCollectionService",
     "MarketDataCollector",
+    "QuoteCollectionResult",
+    "QuoteSnapshotError",
     "MonitoringCycleResult",
     "MonitoringService",
     "QuantitativeAnalysisService",

@@ -24,6 +24,8 @@ def test_windows_launcher_uses_per_user_dpapi_without_embedding_a_token():
     assert "QUANT_MONITOR_DATABASE_PATH" in powershell_text
     assert "$ProcessDatabasePathWasInjected = $false" in powershell_text
     assert "$CustomConfigSupplied = $false" in powershell_text
+    assert "QUANT_MONITOR_CONFIG_PATH" in powershell_text
+    assert "$ConfigPath = [string]$env:QUANT_MONITOR_CONFIG_PATH" in powershell_text
     assert "-not $CustomConfigSupplied" in powershell_text
     assert "Remove-Item Env:\\QUANT_MONITOR_DATABASE_PATH" in powershell_text
     assert "QUANT_MONITOR_ALLTICK_TOKEN" in powershell_text
@@ -92,6 +94,8 @@ def test_windows_bash_delegates_to_the_same_secure_launcher():
     assert "quant_monitor_${QUANT_MONITOR_DATA_PROVIDER}.db" in bash_text
     assert "QUANT_MONITOR_DATABASE_PATH" in bash_text
     assert "CUSTOM_CONFIG_SUPPLIED=0" in bash_text
+    assert 'QUANT_MONITOR_CONFIG_PATH' in bash_text
+    assert 'CONFIG_PATH="$QUANT_MONITOR_CONFIG_PATH"' in bash_text
     assert '[[ "$CUSTOM_CONFIG_SUPPLIED" -eq 0' in bash_text
     assert 'SELECTED_PROVIDER="${QUANT_MONITOR_DATA_PROVIDER:-asharehub}"' in bash_text
     assert 'FORWARD_ARGS+=("$1")' in bash_text
@@ -104,3 +108,11 @@ def test_env_example_matches_safe_runtime_polling_default():
     env_text = (ROOT / ".env.example").read_text(encoding="utf-8")
 
     assert "QUANT_MONITOR_POLL_INTERVAL=60" in env_text
+
+
+def test_windows_healthcheck_wrapper_uses_project_venv_and_forwards_arguments():
+    wrapper = (ROOT / "scripts" / "healthcheck.cmd").read_text(encoding="utf-8")
+    assert "healthcheck.py" in wrapper
+    assert "%~dp0.." in wrapper
+    assert "\\.venv\\Scripts\\python.exe" in wrapper
+    assert 'healthcheck.py" %*' in wrapper

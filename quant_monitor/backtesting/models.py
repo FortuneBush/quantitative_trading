@@ -31,6 +31,29 @@ def _strict_bool(value: Any, name: str) -> bool:
     return value
 
 
+def _freeze_assumption(value: Any) -> Any:
+    """Freeze structured diagnostic assumptions without flattening them.
+
+    Most assumptions are human-readable strings, but research bindings (for
+    example a point-in-time universe) are structured evidence containing a
+    mapping and a tuple of snapshot hashes.  Coercing those values to
+    ``str`` loses the machine-readable binding and makes the diagnostic
+    impossible to consume safely.  Keep JSON-like scalar values as-is and
+    recursively freeze containers so a ``BacktestResult`` remains immutable.
+    """
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            key: _freeze_assumption(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_assumption(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_assumption(item) for item in value)
+    return value
+
+
 def _decimal(value: Any, name: str, *, positive: bool = False) -> Decimal:
     try:
         result = value if isinstance(value, Decimal) else Decimal(str(value))
@@ -166,6 +189,13 @@ class TradingConstraint:
     can_buy: bool = True
     can_sell: bool = True
     reason: str = ""
+    # Optional point-in-time exchange price boundaries.  These are deliberately
+    # separate from ``can_buy``/``can_sell``: touching a limit price is only a
+    # conservative no-fill when the supplied snapshot says the boundary is
+    # locked.  The engine compares the *effective* order price (including
+    # slippage and tick rounding) against these values.
+    limit_up_price: Optional[Decimal] = None
+    limit_down_price: Optional[Decimal] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
@@ -178,6 +208,17 @@ class TradingConstraint:
         object.__setattr__(self, "suspended", _strict_bool(self.suspended, "suspended"))
         object.__setattr__(self, "can_buy", _strict_bool(self.can_buy, "can_buy"))
         object.__setattr__(self, "can_sell", _strict_bool(self.can_sell, "can_sell"))
+        for name in ("limit_up_price", "limit_down_price"):
+            value = getattr(self, name)
+            if value is not None:
+                value = _decimal(value, name, positive=True)
+            object.__setattr__(self, name, value)
+        if (
+            self.limit_up_price is not None
+            and self.limit_down_price is not None
+            and self.limit_up_price < self.limit_down_price
+        ):
+            raise ValueError("limit_up_price cannot be below limit_down_price")
         object.__setattr__(self, "reason", str(self.reason))
 
 
@@ -196,6 +237,9 @@ class Trade:
     slippage_cost: Decimal
     cash_after: Decimal
     tradeability_verified: bool
+    # Net realized P&L for a closing sell.  Buy records and legacy payloads
+    # leave this unset because their cost basis is not realized yet.
+    realized_pnl: Optional[Decimal] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
@@ -219,6 +263,14 @@ class Trade:
             "cash_after",
         ):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        if self.realized_pnl is not None:
+            object.__setattr__(
+                self,
+                "realized_pnl",
+                _decimal_signed(self.realized_pnl, "realized_pnl"),
+            )
+        if self.action == SignalAction.BUY and self.realized_pnl is not None:
+            raise ValueError("buy trade cannot have realized_pnl")
         if self.raw_price == 0 or self.execution_price == 0 or self.gross_notional == 0:
             raise ValueError("trade prices and gross_notional must be positive")
         if self.signal_timestamp >= self.execution_timestamp:
@@ -315,6 +367,30 @@ class BacktestMetrics:
     total_slippage_cost: Decimal
     session_count: int
     trade_count: int
+    # Downside and persistence statistics are optional defaults for backward
+    # compatibility with callers that construct metrics from older payloads.
+    # The engine always populates them for new runs.
+    sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
+    positive_session_ratio: float = 0.0
+    maximum_drawdown_duration_sessions: int = 0
+    # Trade-distribution statistics are based only on completed sell lots.
+    # Defaults preserve compatibility with older callers/artifacts.
+    closed_trade_count: int = 0
+    winning_trade_count: int = 0
+    losing_trade_count: int = 0
+    break_even_trade_count: int = 0
+    win_rate: Optional[float] = None
+    gross_profit: Decimal = Decimal("0")
+    gross_loss: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
+    profit_factor: Optional[float] = None
+    expectancy_per_closed_trade: Optional[Decimal] = None
+    # "unavailable" preserves the meaning of older callers which did not
+    # supply a realized trade ledger. The engine explicitly supplies one of
+    # available/no_closed_trades; undefined ratios remain None, not zero/inf.
+    trade_statistics_status: str = "unavailable"
+    profit_factor_status: str = "unavailable"
 
     def __post_init__(self) -> None:
         for name in (
@@ -323,8 +399,11 @@ class BacktestMetrics:
             "total_commission",
             "total_stamp_duty",
             "total_slippage_cost",
+            "gross_profit",
+            "gross_loss",
         ):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        object.__setattr__(self, "realized_pnl", _decimal_signed(self.realized_pnl, "realized_pnl"))
         for name in (
             "total_return",
             "annualized_return",
@@ -332,16 +411,100 @@ class BacktestMetrics:
             "sharpe_ratio",
             "maximum_drawdown",
             "turnover",
+            "sortino_ratio",
+            "calmar_ratio",
+            "positive_session_ratio",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value):
                 raise ValueError("{} must be finite".format(name))
             object.__setattr__(self, name, value)
-        if self.annualized_volatility < 0 or self.maximum_drawdown < 0 or self.turnover < 0:
+        if self.expectancy_per_closed_trade is not None:
+            object.__setattr__(
+                self, "expectancy_per_closed_trade",
+                _decimal_signed(self.expectancy_per_closed_trade, "expectancy_per_closed_trade"),
+            )
+        for name in ("win_rate", "profit_factor"):
+            value = getattr(self, name)
+            if value is not None:
+                if isinstance(value, bool):
+                    raise TypeError("{} must be a finite number or None".format(name))
+                value = float(value)
+                if not math.isfinite(value):
+                    raise ValueError("{} must be finite".format(name))
+                object.__setattr__(self, name, value)
+        if (
+            self.annualized_volatility < 0
+            or self.maximum_drawdown < 0
+            or self.turnover < 0
+            or not 0.0 <= self.positive_session_ratio <= 1.0
+            or (self.win_rate is not None and not 0.0 <= self.win_rate <= 1.0)
+            or (self.profit_factor is not None and self.profit_factor < 0)
+        ):
             raise ValueError("risk and turnover metrics cannot be negative")
-        for name in ("session_count", "trade_count"):
+        for name in (
+            "session_count",
+            "trade_count",
+            "closed_trade_count",
+            "winning_trade_count",
+            "losing_trade_count",
+            "break_even_trade_count",
+        ):
             value = _strict_int(getattr(self, name), name)
+            if value < 0:
+                raise ValueError("{} cannot be negative".format(name))
             object.__setattr__(self, name, value)
+        if (
+            self.winning_trade_count
+            + self.losing_trade_count
+            + self.break_even_trade_count
+            != self.closed_trade_count
+        ):
+            raise ValueError("trade outcome counts must equal closed_trade_count")
+        if self.closed_trade_count > self.trade_count:
+            raise ValueError("closed_trade_count cannot exceed trade_count")
+        if self.gross_profit < 0 or self.gross_loss < 0:
+            raise ValueError("gross profit and loss cannot be negative")
+        if self.trade_statistics_status not in {"unavailable", "available", "no_closed_trades"}:
+            raise ValueError("invalid trade_statistics_status")
+        if self.profit_factor_status not in {"unavailable", "available", "no_losses", "no_closed_trades"}:
+            raise ValueError("invalid profit_factor_status")
+        if self.trade_statistics_status == "unavailable":
+            if (
+                self.closed_trade_count or self.gross_profit or self.gross_loss or self.realized_pnl
+                or self.win_rate is not None or self.profit_factor is not None
+                or self.expectancy_per_closed_trade is not None
+                or self.profit_factor_status != "unavailable"
+            ):
+                raise ValueError("unavailable trade statistics cannot contain computed values")
+        else:
+            expected_status = "available" if self.closed_trade_count else "no_closed_trades"
+            if self.trade_statistics_status != expected_status:
+                raise ValueError("trade_statistics_status does not match closed_trade_count")
+            expected_pf_status = (
+                "available" if self.gross_loss > 0 else
+                "no_losses" if self.closed_trade_count else "no_closed_trades"
+            )
+            if self.profit_factor_status != expected_pf_status:
+                raise ValueError("profit_factor_status does not match the realized distribution")
+            if (self.profit_factor is None) != (self.gross_loss == 0):
+                raise ValueError("profit_factor is undefined without gross_loss")
+            if (self.win_rate is None) != (self.closed_trade_count == 0) or (
+                (self.expectancy_per_closed_trade is None) != (self.closed_trade_count == 0)
+            ):
+                raise ValueError("win_rate and expectancy require closed trades")
+            if self.closed_trade_count == 0 and (self.gross_profit or self.gross_loss or self.realized_pnl):
+                raise ValueError("no closed trades cannot have realized amounts")
+            if self.realized_pnl != self.gross_profit - self.gross_loss:
+                raise ValueError("realized_pnl must equal gross_profit minus gross_loss")
+        object.__setattr__(
+            self,
+            "maximum_drawdown_duration_sessions",
+            _strict_int(
+                self.maximum_drawdown_duration_sessions,
+                "maximum_drawdown_duration_sessions",
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -359,9 +522,17 @@ class BacktestDiagnostics:
     constrained_session_count: int
     execution_attempt_count: int
     unverified_fill_count: int
-    assumptions: Mapping[str, str]
+    # Values are usually strings, but structured bindings (such as the
+    # resolved PIT universe snapshot hashes) intentionally remain typed.
+    assumptions: Mapping[str, Any]
     warnings: Tuple[str, ...]
     decision_grade: bool
+    # These fields are derived exclusively from the structural evidence that
+    # the engine can actually observe.  They are intentionally ``init=False``
+    # so a caller cannot claim a trusted result by supplying a configuration
+    # string or by editing a serialized payload.
+    decision_grade_checks: Mapping[str, bool] = field(init=False)
+    decision_grade_failures: Tuple[str, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         for name in (
@@ -397,12 +568,21 @@ class BacktestDiagnostics:
         if len(set(warnings)) != len(warnings):
             raise ValueError("warnings must be unique")
         object.__setattr__(self, "warnings", warnings)
-        assumptions = {
-            str(key).strip(): str(value).strip()
-            for key, value in dict(self.assumptions).items()
-        }
-        if any(not key or not value for key, value in assumptions.items()):
-            raise ValueError("assumptions keys and values cannot be empty")
+        if not isinstance(self.assumptions, Mapping):
+            raise TypeError("assumptions must be a mapping")
+        assumptions = {}
+        for raw_key, raw_value in self.assumptions.items():
+            if not isinstance(raw_key, str):
+                raise TypeError("assumptions keys must be strings")
+            key = raw_key.strip()
+            if not key:
+                raise ValueError("assumptions keys cannot be empty")
+            value = _freeze_assumption(raw_value)
+            # Preserve the historical guard for empty textual values while
+            # allowing valid structured values such as an empty hash tuple.
+            if isinstance(value, str) and not value.strip():
+                raise ValueError("assumptions values cannot be empty")
+            assumptions[key] = value
         object.__setattr__(
             self, "assumptions", MappingProxyType(dict(sorted(assumptions.items())))
         )
@@ -411,6 +591,32 @@ class BacktestDiagnostics:
         # dimension, callers cannot promote a research result by constructor
         # input alone.
         object.__setattr__(self, "decision_grade", False)
+
+        # Keep the gate explainable and fail closed.  The current backtest
+        # kernel receives descriptive metadata, not independently authenticated
+        # provenance.  In particular, values such as ``calendar_version`` or
+        # ``bar_availability`` are never interpreted as attestations.  Future
+        # lineage verifiers may replace these checks with verified evidence,
+        # but this model must not infer trust from caller-controlled strings.
+        checks = {
+            "calendar_lineage_attested": False,
+            "bar_availability_attested": False,
+            "execution_bar_availability_attested": False,
+            "corporate_action_lineage_attested": False,
+            "constraints_complete": self.constraint_coverage == 1.0,
+            "fills_tradeability_verified": self.unverified_fill_count == 0,
+            "no_diagnostic_warnings": not bool(self.warnings),
+        }
+        object.__setattr__(
+            self,
+            "decision_grade_checks",
+            MappingProxyType(dict(sorted(checks.items()))),
+        )
+        object.__setattr__(
+            self,
+            "decision_grade_failures",
+            tuple(name for name, passed in sorted(checks.items()) if not passed),
+        )
 
 
 @dataclass(frozen=True)
@@ -472,8 +678,14 @@ class BacktestResult:
         unverified_fill_count = sum(not item.tradeability_verified for item in self.trades)
         if self.diagnostics.unverified_fill_count != unverified_fill_count:
             raise ValueError("diagnostics unverified_fill_count does not match trades")
-        if self.diagnostics.execution_attempt_count < len(self.trades):
-            raise ValueError("diagnostics execution_attempt_count is below trade count")
+        attempted_skips = sum(
+            item.attempted_at is not None for item in self.skipped_executions
+        )
+        expected_attempts = len(self.trades) + attempted_skips
+        if self.diagnostics.execution_attempt_count != expected_attempts:
+            raise ValueError(
+                "diagnostics execution_attempt_count does not match executions"
+            )
         if self.config.price_basis == "raw_unadjusted" and self.diagnostics.decision_grade:
             raise ValueError("raw_unadjusted results cannot be decision_grade")
         if self.diagnostics.decision_grade:

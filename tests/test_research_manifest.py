@@ -17,11 +17,14 @@ from quant_monitor.research import (
     DatasetDescriptor,
     ManifestValidationError,
     ResearchRunManifest,
+    ResearchResultRecord,
     SensitiveManifestValueError,
     canonical_json,
     hash_canonical,
     hash_input_records,
+    verify_input_hash,
 )
+from quant_monitor.research.manifest import _security_scan_text
 
 
 class FixtureState(str, Enum):
@@ -122,6 +125,27 @@ def test_canonical_json_normalizes_supported_types_and_mapping_order():
     assert '"$quant_monitor_type":"datetime"' in encoded
     assert '"$quant_monitor_type":"decimal"' in encoded
     assert '"$quant_monitor_type":"enum"' in encoded
+
+
+def test_verify_input_hash_fails_closed_on_changed_records():
+    records = _records()
+    digest = hash_input_records(records)
+    verify_input_hash(digest, records)
+    changed = list(records)
+    changed[0] = Bar(
+        symbol=changed[0].symbol,
+        interval=changed[0].interval,
+        timestamp=changed[0].timestamp,
+        open=changed[0].open,
+        high=changed[0].high,
+        low=changed[0].low,
+        close=changed[0].close + Decimal("0.01"),
+        volume=changed[0].volume,
+        turnover=changed[0].turnover,
+        source=changed[0].source,
+    )
+    with pytest.raises(ManifestValidationError, match="do not match"):
+        verify_input_hash(digest, changed)
 
 
 @dataclass(frozen=True)
@@ -505,6 +529,40 @@ def test_exception_never_echoes_rejected_secret():
     assert secret not in str(error.value)
 
 
+def test_result_artifact_rejects_credentials_before_immutable_export():
+    """A valid-looking result hash must not make a secret exportable."""
+
+    result = {
+        "strategy_name": "fixture",
+        "diagnostics": {"metadata": {"api_key": "do-not-export"}},
+        "result_hash": "sha256:" + ("0" * 64),
+    }
+    result_json = json.dumps(result, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    with pytest.raises(SensitiveManifestValueError) as error:
+        ResearchResultRecord.from_json(
+            "run-sensitive-result",
+            result_json,
+            created_at=datetime(2025, 1, 6, 15, 30, tzinfo=SHANGHAI_TZ),
+        )
+    assert "do-not-export" not in str(error.value)
+
+
+def test_result_artifact_rejects_embedded_json_credentials():
+    result = {
+        "strategy_name": "fixture",
+        "diagnostics": {"note": '{"nested":{"access_token":"hidden"}}'},
+        "result_hash": "sha256:" + ("0" * 64),
+    }
+    result_json = json.dumps(result, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    with pytest.raises(SensitiveManifestValueError) as error:
+        ResearchResultRecord.from_json(
+            "run-embedded-sensitive-result",
+            result_json,
+            created_at=datetime(2025, 1, 6, 15, 30, tzinfo=SHANGHAI_TZ),
+        )
+    assert "hidden" not in str(error.value)
+
+
 def test_mapping_items_are_snapshotted_once():
     class ItemsOnlyMapping(dict):
         def __init__(self):
@@ -574,3 +632,13 @@ def test_cyclic_values_are_rejected():
 def test_manifest_requires_a_well_formed_input_hash():
     with pytest.raises(ManifestValidationError):
         _manifest(input_hash="not-a-sha256-hash")
+
+
+def test_large_ascii_security_scan_does_not_make_an_extra_filtered_copy():
+    # Result artifacts can contain thousands of equity/trade rows.  The
+    # scanner must retain its checks without doubling peak memory for ordinary
+    # ASCII JSON, which is the serialized artifact's normal representation.
+    value = "{\"equity_curve\":[" + ("0," * 250_000) + "0]}"
+    scanned = _security_scan_text(value)
+    assert scanned == value
+    assert scanned is value

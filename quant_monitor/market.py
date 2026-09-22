@@ -72,6 +72,9 @@ def market_status(
         "calendar_notice": selected.metadata.notice,
         "calendar_source": selected.metadata.source,
         "calendar_version": selected.metadata.version,
+        # Finite versioned calendars expose a deterministic content digest;
+        # fallback/third-party calendars may not, so absence is explicit.
+        "calendar_fingerprint": getattr(selected, "fingerprint", None),
         # No current calendar implementation has an authenticated official
         # attestation.  Do not propagate a truthy flag from a structural
         # Protocol implementation supplied by arbitrary application code.

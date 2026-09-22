@@ -7,11 +7,15 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from quant_monitor.data_sources.asharehub import AShareHubMarketDataProvider
+from quant_monitor.data_sources.asharehub import (
+    AShareHubDataError,
+    AShareHubMarketDataProvider,
+)
 from quant_monitor.data_sources.base import (
     BarFetchResult,
     BarFetchTransport,
     MarketDataProvider,
+    response_content_hash,
 )
 from quant_monitor.domain import Bar, SHANGHAI_TZ
 
@@ -102,9 +106,11 @@ def test_asharehub_lineage_separates_network_observations_from_combined_view(
     assert network.response_received_at == datetime(
         2026, 8, 27, 18, 0, 3, tzinfo=SHANGHAI_TZ
     )
+    assert network.response_content_hash == response_content_hash([_daily_row(27)])
     assert cached.transport is BarFetchTransport.MEMORY_CACHE
     assert cached.observations == ()
     assert cached.response_received_at is None
+    assert cached.response_content_hash is None
     assert legacy == list(network.current_view)
 
 
@@ -134,9 +140,7 @@ def test_asharehub_sqlite_seed_is_not_claimed_as_a_new_observation(tmp_path):
     assert result.response_received_at is None
 
 
-def test_asharehub_lineage_preserves_duplicate_rows_from_one_network_response(
-    tmp_path,
-):
+def test_asharehub_lineage_rejects_conflicting_duplicate_sessions(tmp_path):
     async def exercise():
         clock = _Clock(datetime(2026, 8, 27, 18, 0, tzinfo=SHANGHAI_TZ))
 
@@ -144,24 +148,17 @@ def test_asharehub_lineage_preserves_duplicate_rows_from_one_network_response(
             return [_daily_row(27, close="10.25"), _daily_row(27, close="10.5")]
 
         target = _provider(tmp_path, requester, clock)
-        result = await target.fetch_bars_with_lineage(
-            "600519.SH",
-            interval="1d",
-            start=datetime(2026, 8, 20, tzinfo=SHANGHAI_TZ),
-            end=datetime(2026, 8, 27, 23, 0, tzinfo=SHANGHAI_TZ),
-            limit=2,
-        )
+        with pytest.raises(AShareHubDataError, match="conflicting duplicate"):
+            await target.fetch_bars_with_lineage(
+                "600519.SH",
+                interval="1d",
+                start=datetime(2026, 8, 20, tzinfo=SHANGHAI_TZ),
+                end=datetime(2026, 8, 27, 23, 0, tzinfo=SHANGHAI_TZ),
+                limit=2,
+            )
         await target.close()
-        return result
 
-    result = asyncio.run(exercise())
-    assert result.transport is BarFetchTransport.NETWORK
-    assert [item.close for item in result.observations] == [
-        _bar(27, close="10.25").close,
-        _bar(27, close="10.5").close,
-    ]
-    # Compatibility view still keeps the last row for one logical timestamp.
-    assert [item.close for item in result.bars] == [_bar(27, close="10.5").close]
+    asyncio.run(exercise())
 
 
 class _LegacyProvider(MarketDataProvider):
@@ -208,4 +205,19 @@ def test_bar_fetch_result_rejects_fabricated_cache_receipt_or_observations():
             bars=(_bar(27),),
             observations=(_bar(27),),
             transport=BarFetchTransport.NETWORK,
+        )
+    with pytest.raises(ValueError, match="response_content_hash"):
+        BarFetchResult(
+            bars=(_bar(27),),
+            observations=(),
+            transport=BarFetchTransport.MEMORY_CACHE,
+            response_content_hash="a" * 64,
+        )
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        BarFetchResult(
+            bars=(_bar(27),),
+            observations=(),
+            transport=BarFetchTransport.NETWORK,
+            response_received_at=received_at,
+            response_content_hash="not-a-digest",
         )

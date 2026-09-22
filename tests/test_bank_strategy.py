@@ -153,6 +153,10 @@ def test_top_candidate_is_explainable_and_signal_only():
     assert best.metadata["price_basis"] == "raw_unadjusted"
     assert best.metadata["model_version"] == "bank_daily_multifactor_v1"
     assert best.metadata["signal_only"] is True
+
+    assert best.metadata["entry_eligible"] is True
+    assert best.metadata["gate_failures"] == ()
+    assert best.metadata["exit_reasons"] == ()
     assert best.metadata["bar_as_of"] == best.timestamp.isoformat()
     assert best.strength > 0
     assert set(best.metadata["factor_percentiles"]) == {
@@ -163,6 +167,125 @@ def test_top_candidate_is_explainable_and_signal_only():
         "low_volatility_60",
         "shallow_drawdown_60",
     }
+    contributions = best.metadata["factor_contributions"]
+    weights = best.metadata["factor_weights"]
+    assert set(contributions) == set(weights) == set(best.metadata["factor_percentiles"])
+    assert sum(contributions.values()) == pytest.approx(best.metadata["percentile"])
+    assert best.metadata["score_thresholds"] == {"entry": 0.80, "exit": 0.50}
+
+
+def test_non_candidate_explains_score_threshold_separately_from_boolean_gates():
+    """A HOLD must say whether score/review timing blocked entry.
+
+    ``gate_failures`` only represents boolean health gates.  The explicit
+    entry reasons prevent a mathematically valid, but below-threshold, row
+    from looking unexplained in research screens.
+    """
+    strategy = BankDailyMultifactorStrategy()
+    snapshot = strategy.analyze(_cohort())
+    non_candidates = [
+        item for item in snapshot["items"] if not item["entry_eligible"]
+    ]
+    assert non_candidates
+    item = next(
+        item
+        for item in non_candidates
+        if item["score_thresholds"]["exit"] <= item["score"] < item["score_thresholds"]["entry"]
+    )
+    assert "score_below_entry_percentile" in item["entry_failure_reasons"]
+    assert item["action"] == SignalAction.HOLD.value
+
+
+def test_data_quality_not_decision_ready_suppresses_cross_sectional_signals():
+    context = _cohort()
+    blocked = CohortStrategyContext(
+        timestamp=context.timestamp,
+        members=context.members,
+        cohort=context.cohort,
+        metadata={"strategy_decision_ready": False},
+    )
+    strategy = BankDailyMultifactorStrategy()
+    analysis = strategy.analyze(blocked)
+    assert analysis["ready"] is False
+    assert analysis["reason"] == "data_quality_not_decision_ready"
+    assert all(
+        reason == "data_quality_not_decision_ready"
+        for reason in analysis["excluded"].values()
+    )
+    assert strategy.evaluate(blocked) == ()
+
+
+def _fundamental_report(context, *, decision_at=BASE, scores=None):
+    symbols = tuple(sorted(context.members))
+    values = scores or {
+        symbol: 0.05 + (index / max(len(symbols) - 1, 1)) * 0.90
+        for index, symbol in enumerate(symbols)
+    }
+    return {
+        "selection": "bank_fundamental_factors_as_of_v1",
+        "decision_at": decision_at.isoformat(),
+        "quality": {"status": "ok", "complete_count": len(symbols)},
+        "warnings": [],
+        "items": [
+            {"symbol": symbol, "score": values[symbol], "score_status": "complete"}
+            for symbol in symbols
+        ],
+    }
+
+
+def test_complete_point_in_time_fundamentals_are_explicitly_blended():
+    context = _cohort(count=15)
+    price_only = BankDailyMultifactorStrategy(fundamental_weight=0.0).analyze(context)
+    report = _fundamental_report(context)
+    enriched = CohortStrategyContext(
+        timestamp=context.timestamp,
+        members=context.members,
+        cohort=context.cohort,
+        metadata={"fundamental_factor_report": report},
+    )
+    strategy = BankDailyMultifactorStrategy(fundamental_weight=0.20)
+    snapshot = strategy.analyze(enriched)
+    assert snapshot["ready"] is True
+    assert snapshot["fundamental_overlay"]["enabled"] is True
+    assert snapshot["fundamental_overlay"]["status"] == "applied"
+    baseline = {item["symbol"]: item for item in price_only["items"]}
+    for item in snapshot["items"]:
+        expected = baseline[item["symbol"]]["score"] * 0.80 + report["items"][sorted(context.members).index(item["symbol"])] ["score"] * 0.20
+        assert item["price_score"] == pytest.approx(baseline[item["symbol"]]["score"])
+        assert item["score"] == pytest.approx(expected)
+        assert item["fundamental_overlay"]["enabled"] is True
+        assert item["fundamental_overlay"]["contribution"] == pytest.approx(
+            item["fundamental_overlay"]["score"] * 0.20
+        )
+    signals = strategy.evaluate(enriched)
+    if signals:
+        assert all(signal.metadata["model_variant"] == "price_plus_fundamental_v1" for signal in signals)
+
+
+@pytest.mark.parametrize(
+    "mutate,reason",
+    [
+        (lambda report: report.update({"warnings": ["fundamental_metric_coverage_incomplete"]}), "fundamental_report_has_warnings"),
+        (lambda report: report.update({"decision_at": (BASE + timedelta(days=1)).isoformat()}), "fundamental_report_future_of_decision"),
+        (lambda report: report["items"].pop(), "fundamental_report_coverage_mismatch"),
+    ],
+)
+def test_incomplete_or_future_fundamental_facts_fall_back_to_price_only(mutate, reason):
+    context = _cohort(count=15)
+    report = _fundamental_report(context)
+    mutate(report)
+    strategy = BankDailyMultifactorStrategy(fundamental_weight=0.20)
+    snapshot = strategy.analyze(
+        CohortStrategyContext(
+            timestamp=context.timestamp,
+            members=context.members,
+            cohort=context.cohort,
+            metadata={"fundamental_factor_report": report},
+        )
+    )
+    assert snapshot["fundamental_overlay"]["enabled"] is False
+    assert snapshot["fundamental_overlay"]["reason"] == reason
+    assert all(item["price_score"] == pytest.approx(item["score"]) for item in snapshot["items"])
 
 
 def test_quote_does_not_change_completed_daily_signal():
@@ -221,6 +344,47 @@ def test_suspected_corporate_action_suspends_affected_symbol():
     assert _symbol(14) not in {item.symbol for item in signals}
 
 
+def test_historical_corporate_action_gap_is_not_allowed_to_contaminate_factors():
+    """A gap earlier in the lookback is still a reason to exclude the symbol.
+
+    Momentum and drawdown use nearly the entire 130-session input.  This
+    regression protects against checking only the latest few bars, which
+    would allow an older ex-dividend/split discontinuity to produce a false
+    rank and research signal.
+    """
+    context = _cohort()
+    members = dict(context.members)
+    bars = list(members[_symbol(14)].bars)
+    index = 70
+    previous = bars[index - 1]
+    close = previous.close * Decimal("0.90")
+    bars[index] = Bar(
+        symbol=previous.symbol,
+        interval=previous.interval,
+        timestamp=bars[index].timestamp,
+        open=close,
+        high=close * Decimal("1.01"),
+        low=close * Decimal("0.99"),
+        close=close,
+        volume=previous.volume,
+        turnover=close * Decimal(previous.volume),
+        source=previous.source,
+    )
+    members[_symbol(14)] = StrategyContext(
+        _symbol(14), bars[-1].timestamp, bars=tuple(bars)
+    )
+    analysis = BankDailyMultifactorStrategy(min_universe=14).analyze(
+        CohortStrategyContext(
+            timestamp=context.timestamp,
+            members=members,
+            cohort=context.cohort,
+        )
+    )
+    assert analysis["ready"] is True
+    assert analysis["excluded"][_symbol(14)] == "suspected_corporate_action"
+    assert _symbol(14) not in {item["symbol"] for item in analysis["items"]}
+
+
 def test_risk_exit_overrides_scheduled_entry():
     context = _cohort(count=2)
     members = dict(context.members)
@@ -255,6 +419,7 @@ def test_risk_exit_overrides_scheduled_entry():
     assert risky.action == SignalAction.SELL
     assert risky.strength < 0
     assert risky.metadata["risk_exit"] is True
+    assert "risk_limit" in risky.metadata["exit_reasons"]
 
 
 def test_invalid_zero_volume_member_is_excluded_and_may_make_universe_insufficient():
@@ -293,6 +458,9 @@ def test_tied_factors_get_equal_percentiles_not_symbol_order_advantage():
         CohortStrategyContext(timestamp=BASE, members=members, cohort="banks")
     )
     assert {round(item.metadata["percentile"], 8) for item in signals} == {0.5}
+    # Composite ties must also have the same displayed rank.  Symbol order is
+    # only a rendering order and must not become an implicit preference.
+    assert {item.metadata["rank"] for item in signals} == {1}
 
 
 def test_parameter_validation_protects_hysteresis_and_lookbacks():

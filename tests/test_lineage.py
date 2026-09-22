@@ -13,6 +13,7 @@ from quant_monitor.data_sources import (
     BarFetchResult,
     BarFetchTransport,
     MockMarketDataProvider,
+    response_content_hash,
 )
 from quant_monitor.domain import (
     Adjustment,
@@ -20,12 +21,14 @@ from quant_monitor.domain import (
     BarObservation,
     CollectionBatch,
     CollectionBatchStatus,
+    EventType,
     ObservationQualityStatus,
     normalized_request_hash,
     parse_market_time,
 )
 from quant_monitor.services import EventBus, MarketDataCollectionService
 from quant_monitor.storage import SQLiteRepository
+from quant_monitor.trading_calendar import VersionedSessionCalendar
 
 
 T0 = parse_market_time("2026-09-03T15:30:00+08:00")
@@ -267,6 +270,273 @@ def test_typed_network_bar_result_dual_writes_and_events_only_after_commit(tmp_p
             assert observation.quality_status == ObservationQualityStatus.DEGRADED
             assert repository.get_bars("600000.SH", "1d")[0].timestamp == T0
             assert events
+        finally:
+            repository.close()
+
+
+def test_network_observation_cannot_conflict_with_overlapping_projection(tmp_path):
+    """A truncated view may omit observations, but overlap must be exact."""
+
+    async def exercise():
+        repository = SQLiteRepository(tmp_path / "projection-conflict.sqlite3")
+        repository.initialize()
+        service = MarketDataCollectionService(
+            MockMarketDataProvider(), repository, EventBus(), bar_interval="1d", bar_limit=1
+        )
+        observed = Bar(
+            symbol="600000.SH",
+            interval="1d",
+            timestamp=T0,
+            open=Decimal("10"),
+            high=Decimal("11"),
+            low=Decimal("9"),
+            close=Decimal("10.5"),
+            source="fixture",
+        )
+        # Same period/source, but a different value in the compatibility view.
+        projected = Bar(
+            symbol="600000.SH",
+            interval="1d",
+            timestamp=T0,
+            open=Decimal("10"),
+            high=Decimal("11"),
+            low=Decimal("9"),
+            close=Decimal("10.6"),
+            source="fixture",
+        )
+        try:
+            with pytest.raises(ValueError, match="conflicts with bars projection"):
+                await service.persist_bar_fetch_result(
+                    BarFetchResult(
+                        bars=(projected,),
+                        observations=(observed,),
+                        transport=BarFetchTransport.NETWORK,
+                        response_received_at=T1,
+                    ),
+                    requested_symbols=("600000.SH",),
+                    publish_events=False,
+                )
+            batches, total = repository.query_collection_batches(limit=10)
+            assert total == 1
+            assert batches[0].status == CollectionBatchStatus.FAILED
+            assert batches[0].error_type == "ValueError"
+            assert repository.get_bar_observations("600000.SH", "1d") == []
+            assert repository.get_bars("600000.SH", "1d") == []
+        finally:
+            repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_bar_batch_hash_and_metadata_capture_public_request_window_without_secrets(tmp_path):
+    """Different historical windows must remain distinguishable in lineage."""
+
+    async def exercise():
+        class OptionProvider(MockMarketDataProvider):
+            def __init__(self):
+                super().__init__()
+                self.received_options = []
+
+            async def fetch_bars_with_lineage(self, symbol, **kwargs):
+                self.received_options.append(dict(kwargs))
+                return await super().fetch_bars_with_lineage(
+                    symbol,
+                    interval=kwargs.get("interval", "1d"),
+                    start=kwargs.get("start"),
+                    end=kwargs.get("end"),
+                    limit=kwargs.get("limit", 200),
+                )
+
+        repository = SQLiteRepository(tmp_path / "request-coordinates.sqlite3")
+        repository.initialize()
+        provider = OptionProvider()
+        service = MarketDataCollectionService(
+            provider, repository, EventBus(), bar_interval="1d", bar_limit=2
+        )
+        try:
+            first = await service.collect_bar_batch(
+                ["600000.SH"],
+                publish_events=False,
+                provider_options={
+                    "start": T0,
+                    "end": T1,
+                    "api_key": "must-not-be-persisted",
+                    "headers": {
+                        "Authorization": "must-not-be-persisted",
+                        "client": "research-fixture",
+                    },
+                },
+            )
+            second = await service.collect_bar_batch(
+                ["600000.SH"],
+                publish_events=False,
+                provider_options={"start": T0, "end": T1.replace(day=2)},
+            )
+            assert first.batch_id and second.batch_id and first.batch_id != second.batch_id
+            assert all("api_key" not in options for options in provider.received_options)
+            assert all("headers" not in options for options in provider.received_options)
+            batches, total = repository.query_collection_batches(limit=10)
+            assert total == 2
+            assert batches[0].input_hash != batches[1].input_hash
+            for batch in batches:
+                request = batch.metadata["request"]
+                assert "api_key" not in request["provider_options"]
+                if "headers" in request["provider_options"]:
+                    assert request["provider_options"]["headers"] == {
+                        "client": "research-fixture"
+                    }
+                assert request["bar_interval"] == "1d"
+                assert request["bar_limit"] == 2
+        finally:
+            repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_collection_quarantines_fresh_off_calendar_rows_without_publishing_or_indicators(tmp_path):
+    """A bad session date remains auditable but cannot drive live research state."""
+
+    async def exercise():
+        repository = SQLiteRepository(tmp_path / "off-calendar.sqlite3")
+        repository.initialize()
+        bus = EventBus()
+        events = []
+
+        async def observe(event):
+            events.append(event)
+
+        await bus.subscribe(None, observe)
+        service = MarketDataCollectionService(
+            MockMarketDataProvider(), repository, bus, bar_interval="1d", bar_limit=2
+        )
+        weekday = Bar(
+            symbol="600000.SH",
+            interval="1d",
+            timestamp=parse_market_time("2026-09-03T15:30:00+08:00"),
+            open="10",
+            high="11",
+            low="9",
+            close="10.5",
+            source="fixture",
+        )
+        weekend = Bar(
+            symbol="600000.SH",
+            interval="1d",
+            timestamp=parse_market_time("2026-09-05T15:30:00+08:00"),
+            open="10.5",
+            high="11",
+            low="10",
+            close="10.8",
+            source="fixture",
+        )
+        try:
+            result = await service.persist_bar_fetch_result(
+                BarFetchResult(
+                    bars=(weekday, weekend),
+                    observations=(weekday, weekend),
+                    transport=BarFetchTransport.NETWORK,
+                    response_received_at=parse_market_time("2026-09-06T09:00:00+08:00"),
+                ),
+                requested_symbols=("600000.SH",),
+            )
+            observations = repository.get_bar_observations("600000.SH", "1d")
+            assert len(observations) == 2
+            assert observations[0].quality_status == ObservationQualityStatus.DEGRADED
+            assert observations[1].quality_status == ObservationQualityStatus.QUARANTINED
+            assert result.metrics == ()
+            assert [event.payload.timestamp.date().isoformat() for event in events if event.type == EventType.BAR] == [
+                "2026-09-03"
+            ]
+            batch = repository.get_collection_batch(result.batch_id)
+            assert batch is not None
+            assert batch.metadata["quarantined_observation_count"] == 1
+            assert batch.metadata["quarantined_observation_reasons"] == ["off_calendar_session"]
+            # The legacy view retains both rows so the quality audit can report
+            # the offending date instead of erasing evidence.
+            assert len(repository.get_bars("600000.SH", "1d")) == 2
+        finally:
+            repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_collection_persists_parsed_provider_response_digest_without_raw_payload(tmp_path):
+    """Lineage exposes a comparable receipt while keeping response bodies out of SQLite."""
+
+    async def exercise():
+        repository = SQLiteRepository(tmp_path / "response-digest.sqlite3")
+        repository.initialize()
+        service = MarketDataCollectionService(
+            MockMarketDataProvider(), repository, EventBus(), bar_interval="1d", bar_limit=1
+        )
+        bar = Bar(
+            symbol="600000.SH",
+            interval="1d",
+            timestamp=T0,
+            open="10",
+            high="11",
+            low="9",
+            close="10.5",
+            source="fixture",
+        )
+        response_rows = [{"symbol": bar.symbol, "close": str(bar.close), "token": "never-store"}]
+        digest = response_content_hash(response_rows)
+        try:
+            result = await service.persist_bar_fetch_result(
+                BarFetchResult(
+                    bars=(bar,),
+                    observations=(bar,),
+                    transport=BarFetchTransport.NETWORK,
+                    response_received_at=T1,
+                    response_content_hash=digest,
+                ),
+                requested_symbols=(bar.symbol,),
+                publish_events=False,
+            )
+            batch = repository.get_collection_batch(result.batch_id)
+            assert batch is not None
+            assert batch.metadata["response_content_hash"] == digest
+            assert batch.metadata["response_content_hash_scope"] == "parsed_json_response"
+            serialized = str(batch.metadata)
+            assert "never-store" not in serialized
+            assert "token" not in serialized
+        finally:
+            repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_collection_quarantines_rows_outside_finite_calendar_coverage(tmp_path):
+    async def exercise():
+        repository = SQLiteRepository(tmp_path / "calendar-coverage.sqlite3")
+        repository.initialize()
+        calendar = VersionedSessionCalendar(
+            (parse_market_time("2026-09-03T15:30:00+08:00").date(),),
+            source="fixture",
+            version="2026.1",
+        )
+        service = MarketDataCollectionService(
+            MockMarketDataProvider(), repository, EventBus(),
+            bar_interval="1d", trading_calendar=calendar,
+        )
+        bar = Bar(
+            symbol="600000.SH", interval="1d",
+            timestamp=parse_market_time("2026-09-04T15:30:00+08:00"),
+            open="10", high="11", low="9", close="10.5", source="fixture",
+        )
+        try:
+            result = await service.persist_bar_fetch_result(
+                BarFetchResult(
+                    bars=(bar,), observations=(bar,),
+                    transport=BarFetchTransport.NETWORK,
+                    response_received_at=parse_market_time("2026-09-05T09:00:00+08:00"),
+                ), requested_symbols=("600000.SH",), publish_events=False,
+            )
+            observation = repository.get_bar_observations("600000.SH", "1d")[0]
+            assert observation.quality_status == ObservationQualityStatus.QUARANTINED
+            batch = repository.get_collection_batch(result.batch_id)
+            assert batch.metadata["quarantined_observation_reasons"] == ["calendar_coverage_unknown"]
+            assert batch.metadata["request"]["calendar"]["fingerprint"] == calendar.fingerprint
         finally:
             repository.close()
 

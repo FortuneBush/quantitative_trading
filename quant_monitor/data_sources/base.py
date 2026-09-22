@@ -7,9 +7,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 import asyncio
+import hashlib
+import json
 from typing import List, Optional, Sequence, Tuple
 
 from quant_monitor.domain import Bar, Instrument, Quote, ensure_market_time
+from quant_monitor.trading_calendar import TradingCalendar
 
 
 class BarFetchTransport(str, Enum):
@@ -28,6 +31,24 @@ class BarFetchTransport(str, Enum):
     LEGACY_UNKNOWN = "legacy_unknown"
 
 
+def response_content_hash(value: object) -> str:
+    """Digest a parsed provider response without retaining its raw body.
+
+    This is a deterministic receipt for lineage comparison, not a vendor
+    signature.  Raw bodies are intentionally never persisted because they can
+    echo credentials, request headers, or unrelated account metadata.
+    """
+
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 @dataclass(frozen=True)
 class BarFetchResult:
     """A compatible bar view plus the observations made by this fetch.
@@ -42,6 +63,7 @@ class BarFetchResult:
     observations: Tuple[Bar, ...]
     transport: BarFetchTransport
     response_received_at: Optional[datetime] = None
+    response_content_hash: Optional[str] = None
 
     def __post_init__(self) -> None:
         bars = tuple(self.bars)
@@ -68,10 +90,24 @@ class BarFetchResult:
                 raise ValueError(
                     "only a network bar fetch can have response_received_at"
                 )
+        response_hash = self.response_content_hash
+        if response_hash is not None:
+            response_hash = str(response_hash).strip().lower()
+            if len(response_hash) != 64 or any(
+                char not in "0123456789abcdef" for char in response_hash
+            ):
+                raise ValueError(
+                    "response_content_hash must be a lowercase SHA-256 hex digest"
+                )
+            if transport is not BarFetchTransport.NETWORK:
+                raise ValueError(
+                    "only a network bar fetch can have response_content_hash"
+                )
         object.__setattr__(self, "bars", bars)
         object.__setattr__(self, "observations", observations)
         object.__setattr__(self, "transport", transport)
         object.__setattr__(self, "response_received_at", received_at)
+        object.__setattr__(self, "response_content_hash", response_hash)
 
     @property
     def current_view(self) -> Tuple[Bar, ...]:
@@ -203,6 +239,18 @@ class MarketDataProvider(ABC):
         """Return an optional quota-safe configured quote scope."""
 
         return ()
+
+    def get_trading_calendar(
+        self, symbols: Optional[Sequence[str]] = None
+    ) -> Optional[TradingCalendar]:
+        """Return a cache-only session calendar when the provider supports one.
+
+        Providers without an exchange calendar return ``None``.  Runtime
+        callers then retain the explicit weekday fallback; this hook never
+        performs network I/O and therefore cannot consume a provider quota.
+        """
+
+        return None
 
     @property
     def supported_intervals(self) -> Optional[Sequence[str]]:

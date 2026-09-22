@@ -43,6 +43,14 @@ Windows 的 Git Bash 和已启用 Windows 互操作的 WSL 会自动复用 Windo
 启动器还会为每个 provider 自动使用独立数据库，例如 AShareHub 对应
 `data/quant_monitor_asharehub.db`、mock 对应 `data/quant_monitor_mock.db`，避免不同来源因旧版
 主键未包含 `source` 而互相覆盖；显式设置 `QUANT_MONITOR_DATABASE_PATH` 时以你的路径为准。
+如果通过环境变量指定配置文件，启动器也会按该文件选择 provider 并跳过自动数据库注入：
+
+```powershell
+$env:QUANT_MONITOR_CONFIG_PATH = "config\default.json"
+scripts\start.cmd --no-browser
+```
+
+显式 `--provider` 或 `--config` 参数优先于环境配置；配置文件仍不能包含 API Key。
 
 脚本会在首次启动时创建对应虚拟环境并安装必要依赖，随后打开：
 
@@ -87,7 +95,67 @@ API 文档位于 `http://127.0.0.1:8000/api/docs`。
 GET http://127.0.0.1:8000/api/v1/sectors/banks
 GET http://127.0.0.1:8000/api/v1/analysis/600036.SH?interval=1d&limit=240
 GET http://127.0.0.1:8000/api/v1/data-quality/daily
+GET http://127.0.0.1:8000/api/v1/fundamentals/factors/as-of?as_of=2026-09-18T15:30:00%2B08:00
+GET http://127.0.0.1:8000/api/v1/research/results
+GET http://127.0.0.1:8000/api/v1/research/runs/{run_id}/export
+GET http://127.0.0.1:8000/api/v1/research/runs/{run_id}/risk
+GET http://127.0.0.1:8000/api/v1/research/runs/{run_id}/integrity
+GET http://127.0.0.1:8000/metrics
 ```
+
+下载的研究包可离线校验 manifest、结果内容 hash 和 canonical JSON 字节 hash；不会启动服务或
+消耗行情额度：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\verify_research_export.py .\research-run.json
+.\.venv\Scripts\python.exe scripts\verify_research_export.py .\research-run.json --require-result --json
+```
+
+没有绑定不可变结果的清单会报告 `incomplete`；`--require-result` 适合归档任务门禁。
+
+大规模缓存回测可提交为受控异步作业：
+`POST /api/v1/research/runs/{run_id}/backtest/jobs`，用返回的 `job_id` 查询
+`GET .../backtest/jobs/{job_id}`；支持 `Idempotency-Key`，结果完成后仍从同一运行的
+`/result`、`/risk` 和 `/integrity` 接口读取。作业状态仅保存在当前进程，服务重启不会重放。
+
+`/metrics` 返回 Prometheus 文本格式的本地健康、采集器（含周期累计成功/失败/部分成功/取消
+计数）、历史补数和额度估算指标；
+抓取只读内存/SQLite，不会触发上游请求，也不会导出证券代码或 API Key。
+`/api/v1/system/status` 中的 `provider.quote_freshness` 进一步区分已收到、过期、缺失
+和未来时间戳报价；交易时段内真实 provider 的这些异常会进入 `provider.issues`，休市时
+保留上一交易日快照不会被错误标记为故障。
+
+可在服务运行期间用 SQLite 在线备份工具创建经过完整性校验的副本（不会访问行情源）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\backup_db.py data\quant_monitor_asharehub.db backups\asharehub.sqlite3
+```
+
+工具会先写临时文件并执行 `PRAGMA integrity_check`，校验通过后才原子替换目标文件。
+`--timeout` 同时限制 SQLite 锁等待和在线复制阶段的 deadline；超时不会发布半成品。
+完整性检查、内容摘要与磁盘同步不计入复制期限。
+
+可在不启动服务、也不访问行情源的情况下校验备份或做空目录恢复演练：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\verify_backup.py backups\asharehub.sqlite3
+.\.venv\Scripts\python.exe scripts\verify_backup.py backups\asharehub.sqlite3 --restore-dir tmp\restore-drill
+```
+
+校验会检查 SQLite 完整性、迁移 ledger checksum 和精确 schema 合约；`verify_backup.py --timeout`
+在纯校验模式也会透传该锁等待上限；恢复演练要求目标目录为空，
+成功后输出恢复文件路径、schema 版本和表数量。该工具不会覆盖已有目录内容，也不会触发供应商请求。
+
+可将备份新鲜度（RPO）和完整性纳入定时任务。以下命令读取文件时间戳并执行只读
+SQLite/schema 校验；所有归档均在允许年龄内且校验通过时返回退出码 `0`，缺失、过期、
+未来时间戳或损坏归档返回非零并输出机器可读 JSON：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\backup_slo.py backups\asharehub.sqlite3 --max-age 86400
+```
+
+该检查完全离线，不启动服务、不访问行情源；`--max-age` 可按本地 RPO 目标调整，
+`--timeout` 控制每个归档的 SQLite 锁等待上限。
 
 ## 当前已具备
 
@@ -95,14 +163,22 @@ GET http://127.0.0.1:8000/api/v1/data-quality/daily
 - `Instrument / Quote / Bar / Metric / Alert / Signal` 领域模型
 - 价格使用 `Decimal`，时间统一为带 `+08:00` 的 `Asia/Shanghai`
 - SQLite WAL 持久化、幂等 upsert 与带 checksum/回滚保护的版本迁移
+- 不可变研究运行与回测结果制品持久化，支持结果哈希和重启后复核
+- 研究运行可导出为包含 manifest、结果和完整性摘要的离线 JSON 研究包（不触发上游请求）
 - SMA、EMA、RSI、收益率、波动率、涨跌幅等指标
 - 42 只沪深上市银行静态兜底池，并优先使用 AShareHub 证券目录的 `industry=银行` 动态分类
 - AShareHub 证券目录需通过总量、银行数量与单一来源完整性门禁后才会原子替换本地目录；部分响应继续使用明确标注的静态兜底
 - 银行股横截面多因子研究模型：趋势、动量、低波动、回撤、流动性和板块宽度
+- 银行策略可选 PIT 基本面叠加（默认权重 20%，由 `bank_strategy_fundamental_weight` / `QUANT_MONITOR_BANK_STRATEGY_FUNDAMENTAL_WEIGHT` 配置，设为 0 可关闭）
+- 离线基本面导入器：`scripts/import_fundamentals.py`，支持 JSON/JSONL、dry-run、内容哈希校验和幂等追加，不访问 provider
 - 后台轮询、事件总线、错误告警及优雅启停
 - 真实数据源启动非阻塞、逐股日线断点式落库、额度保留和可视化补数进度
 - 纯离线日线质量审计：缺口、重复、乱序、未来数据、覆盖率和横截面共同日期
 - 研究用途日频回测内核：复用策略协议，次日开盘、100 股整数手、费用/滑点/印花税、T+1 与不可成交约束
+- 回测风险统计：Sharpe、Sortino、Calmar、正收益会话比例与最大回撤持续期；已平仓交易另提供胜率、Profit Factor（毛盈利/毛亏损）、净已实现盈亏和单笔期望值；无平仓或无亏损等不可评估项显示 `—` 并说明原因
+- 组合基准归因：累计/年化超额收益、Alpha/Beta、相关性、跟踪误差、信息比率和上下行捕获；另提供逐期现金感知归因（基准、现金、费用、主动/未分配贡献）；基准/现金序列均由研究调用方显式提供
+- 版本化离线交易日历快照：SHA-256 指纹、严格导入校验，并在质量报告/市场状态中回显日历血缘
+- AShareHub 已加载交易日历会以同一个有限 `TradingCalendar` 视图注入采集质量、日线质量 API 与缓存回测；覆盖不足/过期/跨交易所不完整时统一回退并披露 `weekday_fallback`，不会把单边日历冒充全市场证据
 - REST API、本地事件 WebSocket 和响应式中文仪表盘
 - 默认仅监听 `127.0.0.1`，API 密钥无需进入浏览器
 
@@ -114,12 +190,33 @@ GET http://127.0.0.1:8000/api/v1/data-quality/daily
 $env:QUANT_MONITOR_PORT = "8001"
 $env:QUANT_MONITOR_POLL_INTERVAL = "3"  # 也支持完整名 POLL_INTERVAL_SECONDS
 $env:QUANT_MONITOR_DB_PATH = "data/my_monitor.db"  # 也支持完整名 DATABASE_PATH
+$env:QUANT_MONITOR_API_MAX_REQUEST_BODY_BYTES = "8388608"  # 默认 8 MiB，范围 64 KiB–64 MiB
 ```
 
 也可复制 `.env.example` 作为字段参考，但程序不会自动读取 `.env`。AShareHub 密钥只通过
 `QUANT_MONITOR_ASHAREHUB_API_KEY`（兼容短别名 `QUANT_MONITOR_ASHAREHUB_KEY`）接收；
 `scripts\start.cmd` 可从当前 Windows 用户的 DPAPI 加密凭据中读取后注入启动进程。
+
+启动后可用标准库就绪探针确认服务确实可访问（适合 Windows Task Scheduler、批处理或
+监控软件；探针不会调用行情供应商）：
+
+```powershell
+scripts\healthcheck.cmd --wait 60
+# 若还要求最低历史覆盖完成：
+scripts\healthcheck.cmd --wait 300 --require-research
+# 可选：确认探测到的实例确实使用 AShareHub（切换 provider 后推荐）
+scripts\healthcheck.cmd --wait 60 --provider asharehub
+# 若要求 AShareHub SSE/SZSE 交易日历缓存完整：
+scripts\healthcheck.cmd --wait 60 --provider asharehub --require-calendar
+```
+
+探针成功返回退出码 `0`，服务仍在启动、研究数据未就绪或无法连接时返回非零退出码，
+并输出脱敏 JSON（包含状态码、启动阶段、就绪标志和实际 provider）。指定 `--provider`
+后若实例使用了其他数据源，探针返回 `unexpected_provider` 和非零退出码。
+`--require-calendar` 在日历缓存未启用、过期、损坏或不完整时返回 `calendar_not_ready`。
 密钥不允许写入默认 JSON、日志、公开配置、WebSocket 或浏览器代码。
+API 对带 `Content-Length` 的非 multipart 请求体执行大小上限检查，超过上限返回
+`413 request_too_large`；无 `Content-Length`（如 chunked）和 multipart 请求不受该早期检查影响。
 
 ## 项目结构
 
@@ -167,6 +264,7 @@ scripts/             Windows 启动脚本
 - `GET /v2/market/realtime` 一次最多批量请求 200 个代码，返回最新价、日内开高低、昨收、当日累计成交量/成交额和供应商快照时间；
 - `GET /v2/market/daily` 提供收盘后更新的未复权日线。供应商日线 `vol` 单位为手、`amount` 单位为千元，适配器统一转换成股和元；
 - `GET /v2/reference/stocks` 提供证券主数据。目录长缓存，不在每个采集周期重复请求；
+- `GET /v2/reference/trade-calendar` 提供 SSE/SZSE 交易日与 `pretrade_date`。默认配置按交易所缓存 7 天并原子写入 `data/asharehub_trade_calendar.json`，节假日工作日不会误触发实时请求；缓存失效或额度不足时状态会明确降级为 `weekday_fallback`；
 - `/api/v1/market/quotes` 在 AShareHub 模式只覆盖配置自选范围，不会用完整证券目录隐式扫描全市场；
 - AShareHub 当前文档没有股票 WebSocket、逐笔成交、五档盘口或分钟 K 线接口。本项目 `/ws/market` 是本地 FastAPI 对已采集快照的推送，不代表连接到 AShareHub 推送流；盘口字段保持为空，策略默认使用 `1d`；
 - 供应商非交易时段返回上一交易日收盘快照，页面以 `trade_time` 和本地新鲜度标识展示，不用本机接收时间冒充交易时间。
@@ -174,6 +272,17 @@ scripts/             Windows 启动脚本
 免费档为 100 次请求/日。默认银行配置以一次请求批量获取约 42 只银行快照，快照缓存 300 秒、采集循环 60 秒；正常交易时段理论上最多约 48 次快照请求，实际还受软预算和非交易时段复用保护。首次补齐 42 只银行日线约需 42 次。历史补数在后台逐只持久化，默认始终保留软预算中的 10 次给实时快照和人工操作；达到保留线后暂停，并在下一上海自然日预算重置后继续。预算状态持久化到
 `data/asharehub_budget.json`，并使用跨进程锁原子递增；计数按不可逆密钥哈希身份隔离，文件不保存明文密钥，重启不会清零且手工冒烟也计入同一预算。默认报价缓存 300 秒、日线缓存 24 小时、证券目录缓存
 7 天且自动批量合并银行代码。页面的银行筛选、排序、排名只读取 `/api/v1/sectors/banks` 的 SQLite 聚合结果，不会新增上游调用。
+
+选择银行股后，还可展开“银行基本面”查看 PB、ROE 等七项独立研究指标及其来源、报告期、
+可用时间和修订证据。无本地事实或口径不可比时显示不可用，不用零补缺；这些分数尚未纳入
+价格策略或买卖信号。当前 AShareHub 没有基本面 feed，新增视图不会自动请求或伪造财报数据；
+只有显式完整的本地点时点事实才会进入下述策略叠加门。
+详见 [基本面契约](docs/fundamentals.md)。
+
+如果本地已导入完整、可比且不晚于决策时点的基本面事实，银行策略会使用默认 20% 的显式
+基本面叠加权重；结果同时保留原价格分与基本面贡献。事实缺失、冲突或晚于 K 线决策时点时，
+策略自动回退到价格-only，并在 `fundamental_overlay.reason` 披露原因。回测不会读取实时
+SQLite 基本面，避免把事后导入的数据泄漏到历史运行。
 目录刷新只有在至少包含 1,000 只证券、40 只银行且全部标记为 AShareHub 来源时才会原子替换缓存，防止分页截断或字段漂移把不完整横截面冒充成银行全集。
 收到 429 或达到本地软预算后会停止新增上游调用并将服务标为降级，而不是无限重试。
 
@@ -191,12 +300,44 @@ AShareHub 文档：<https://asharehub.com/zh/docs>。
 
 默认 `bank_daily_multifactor_v1` 在同一已完成交易日上对至少 15 只、每只至少 130 根日线的银行股做横截面排名。因子包括价格相对 120 日均线、20/60 日均线、60-5 与 120-20 日动量、60 日低波动和较浅回撤，并用流动性与板块宽度门控。候选每周复核，风险退出每日检查；页面展示证据、风险和失效条件。
 
+每个研究条目同时返回因子分位数、权重和加权贡献（贡献之和等于综合得分），以及入场/退出阈值；同分股票共享 competition rank，避免按代码顺序人为打破并列。
+
 当前 AShareHub 日线是未复权价格。银行股分红较频繁，代码会对疑似除权缺口暂停新信号，但该启发式不能替代前复权数据。因此输出仅是“偏强研究 / 中性观察 / 偏弱研究”，不能直接作为买卖指令。正式使用前还需用点时点银行名单、复权行情、交易成本、T+1、涨跌停和停牌约束做无未来函数回测。
 
 仓库现已提供纯内存 `quant_monitor.backtesting.BacktestEngine` 作为研究验证基础：策略只能看到
 当前及过去日线，信号最早在下一数据会话开盘尝试执行，并显式记录无法成交的研究信号。
 它不会访问网络、数据库或券商，也不会发送订单。当前结果仍受未复权行情、周一至周五兜底日历、
 当前股票池的幸存者偏差和缺少官方涨跌停/停牌历史约束影响，不能作为实盘收益承诺。
+
+回测结果还可在不访问数据源的前提下执行历史尾部风险、基准归因、逐期现金感知归因、固定情景压力和成交容量审计；
+这些报告会明确列出样本不足、缺少成交量或参与率超限，不会把不可评估项填成零。对应接口见
+`/api/v1/research/runs/{run_id}/risk`、`/benchmark`、`/attribution`、`/stress` 和 `/capacity`。结果归档还可
+调用 `/api/v1/research/runs/{run_id}/integrity`，从保存的净值曲线与成交台账重算指标并报告
+具体不一致项；它只读本地结果，不访问 provider。
+研究实验还提供严格的 `run_walk_forward()` 样本外切分：候选策略只用训练/验证窗口选择，
+测试窗口在选择后才执行，失败候选会留在报告中，避免只展示最佳参数结果。
+已登记的实验可通过 `/api/v1/research/runs/compare?run_ids=id1,id2` 做只读横向比较，
+响应包含版本指纹、结果哈希和核心绩效指标，不会触发新的行情请求。
+交易日历夹具可通过 `scripts/validate_calendar_snapshot.py path\to\calendar.json` 离线校验；
+部署或研究清单可追加 `--expected-fingerprint`、`--expected-identifier`、
+`--expected-source`、`--expected-version`，确保导入的是预期修订而不是另一份内容完整的快照；
+`CalendarSnapshotStore` 按 SHA-256 指纹追加保存修订，避免新公告覆盖旧研究运行引用的日历。
+这些快照仍明确标记为未认证，不能替代交易所官方核验。
+组合快照会校验现金、持仓市值与 NAV 恒等式，并报告现金权重、单票权重和集中度；
+它是离线研究对象，不会转换为订单。
+领域层同时提供带 `available_at`/修订号的 `FundamentalObservation` 和 as-of 选择器；
+SQLite v7 以 append-only 方式保存这些事实，并提供只读
+`GET /api/v1/fundamentals/as-of?as_of=...`。接口只读本地缓存、不触发 provider；在
+AShareHub 未提供基本面前空结果是可观察状态，不会虚构数据。
+`GET /api/v1/fundamentals/factors/as-of?as_of=...` 会在同一时点语义下生成银行 PB、ROE、
+股息率、不良率、拨备覆盖率、资本充足率和成本收入比因子；七项覆盖不完整时综合分数保持
+空值，并返回具体缺失/单位错误原因。
+公司行动和复权因子现由 SQLite v8 以 append-only 方式持久化，PIT 股票池快照由 SQLite v9
+以 append-only 方式持久化，提供只读
+`GET /api/v1/corporate-actions` 与 `GET /api/v1/adjustment-factors`；查询支持
+`as_of` 收据/计算时间截断，重复投递幂等、同一 ID 内容冲突失败关闭。公司行动回放支持
+现金分红、送股、拆并股和显式配股认购，返回不可变账本效果；零股、税费等交易所规则仍需
+由后续执行约束模型提供。复权因子只生成显式 adjusted view，不会覆盖原始未复权 K 线。
 
 ## 兼容 AllTick 数据源
 

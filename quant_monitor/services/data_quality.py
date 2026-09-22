@@ -19,7 +19,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from quant_monitor.domain import Bar, ensure_market_time, normalize_symbol
 from quant_monitor.market import expected_latest_daily_date
-from quant_monitor.trading_calendar import DEFAULT_TRADING_CALENDAR, TradingCalendar
+from quant_monitor.trading_calendar import (
+    CalendarRangeError,
+    DEFAULT_TRADING_CALENDAR,
+    TradingCalendar,
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,12 @@ class SymbolDailyQuality:
     source_consistent: bool
     source_complete: bool
     missing_source_row_count: int
+    # Missing rows are expressed in trading-session order, not calendar-day
+    # distance.  This keeps a holiday from looking like a multi-day data gap.
+    max_missing_streak: int = 0
+    missing_session_ranges: Tuple[str, ...] = ()
+    calendar_out_of_coverage_date_count: int = 0
+    calendar_out_of_coverage_dates: Tuple[str, ...] = ()
 
     @property
     def healthy(self) -> bool:
@@ -90,6 +100,10 @@ class SymbolDailyQuality:
             "source_consistent": self.source_consistent,
             "source_complete": self.source_complete,
             "missing_source_row_count": self.missing_source_row_count,
+            "max_missing_streak": self.max_missing_streak,
+            "missing_session_ranges": list(self.missing_session_ranges),
+            "calendar_out_of_coverage_date_count": self.calendar_out_of_coverage_date_count,
+            "calendar_out_of_coverage_dates": list(self.calendar_out_of_coverage_dates),
         }
 
 
@@ -123,6 +137,16 @@ class DailyDataQualitySummary:
     missing_source_symbols: Tuple[str, ...]
     source_consistent: bool
     symbols: Tuple[SymbolDailyQuality, ...]
+    # The calendar identity and finite coverage are part of the quality
+    # result, so consumers can tell whether a gap is inside a known calendar
+    # window or outside the offline fixture's evidence.
+    calendar_coverage_start: Optional[str] = None
+    calendar_coverage_end: Optional[str] = None
+    # A finite VersionedSessionCalendar supplies a deterministic snapshot
+    # digest; fallback and arbitrary injected calendars remain explicitly
+    # un-fingerprinted rather than inventing provenance.
+    calendar_fingerprint: Optional[str] = None
+    max_missing_streak: int = 0
 
     @property
     def healthy(self) -> bool:
@@ -142,6 +166,7 @@ class DailyDataQualitySummary:
             "calendar_source": self.calendar_source,
             "calendar_version": self.calendar_version,
             "calendar_verified": self.calendar_verified,
+            "calendar_fingerprint": self.calendar_fingerprint,
             "expected_latest_date": self.expected_latest_date,
             "required_history_bars": self.required_history_bars,
             "expected_symbol_count": self.expected_symbol_count,
@@ -153,6 +178,11 @@ class DailyDataQualitySummary:
             "mixed_source_symbols": list(self.mixed_source_symbols),
             "missing_source_symbols": list(self.missing_source_symbols),
             "source_consistent": self.source_consistent,
+            "calendar_coverage": {
+                "start": self.calendar_coverage_start,
+                "end": self.calendar_coverage_end,
+            },
+            "max_missing_streak": self.max_missing_streak,
             "source_lineage": {
                 "sources": list(self.sources),
                 "mixed_source_symbols": list(self.mixed_source_symbols),
@@ -233,18 +263,71 @@ class DailyBarDataQualityService:
                 date_counts[item] = date_counts.get(item, 0) + 1
 
             unique_dates = set(date_counts)
-            off_calendar = tuple(
-                sorted(item for item in unique_dates if not self.calendar.is_session(item))
-            )
+            off_calendar_values = []
+            out_of_coverage_values = []
+            for item in sorted(unique_dates):
+                try:
+                    is_session = self.calendar.is_session(item)
+                except CalendarRangeError:
+                    # A finite calendar cannot infer an unknown weekday. Keep
+                    # it visible as an explicit coverage problem rather than
+                    # silently treating it as a holiday or dropping the row.
+                    out_of_coverage_values.append(item)
+                    continue
+                if not is_session:
+                    off_calendar_values.append(item)
+            off_calendar = tuple(off_calendar_values)
+            out_of_coverage = tuple(out_of_coverage_values)
             off_calendar_set = set(off_calendar)
+            out_of_coverage_set = set(out_of_coverage)
             usable_dates = {
                 item
                 for item in unique_dates
-                if item <= expected_latest and item not in off_calendar_set
+                if item <= expected_latest
+                and item not in off_calendar_set
+                and item not in out_of_coverage_set
             }
             usable_dates_by_symbol[symbol] = usable_dates & required_date_set
             available = len(usable_dates_by_symbol[symbol])
             missing = tuple(sorted(required_date_set - usable_dates))
+            # Express missingness in the calendar's session order.  Counting
+            # date deltas would incorrectly treat exchange holidays as data
+            # gaps.  Keep compact inclusive ranges for UI and diagnostics.
+            missing_indices = sorted(
+                required_dates.index(item) for item in missing
+            )
+            missing_streak = 0
+            missing_ranges: List[str] = []
+            if missing_indices:
+                range_start = range_previous = missing_indices[0]
+                for index in missing_indices[1:]:
+                    if index == range_previous + 1:
+                        range_previous = index
+                        continue
+                    missing_ranges.append(
+                        "{}..{}".format(
+                            required_dates[range_start].isoformat(),
+                            required_dates[range_previous].isoformat(),
+                        )
+                    )
+                    range_start = range_previous = index
+                missing_ranges.append(
+                    "{}..{}".format(
+                        required_dates[range_start].isoformat(),
+                        required_dates[range_previous].isoformat(),
+                    )
+                )
+            # Recompute the longest run independently of range boundaries.
+            longest_missing_streak = 0
+            current_missing_streak = 0
+            previous_index = None
+            for index in missing_indices:
+                if previous_index is not None and index == previous_index + 1:
+                    current_missing_streak += 1
+                else:
+                    current_missing_streak = 1
+                longest_missing_streak = max(longest_missing_streak, current_missing_streak)
+                previous_index = index
             duplicates = tuple(sorted(item for item, count in date_counts.items() if count > 1))
             future = tuple(sorted(item for item in unique_dates if item > expected_latest))
             duplicate_rows = sum(date_counts[item] - 1 for item in duplicates)
@@ -286,6 +369,7 @@ class DailyBarDataQualityService:
                 or out_of_order
                 or future
                 or off_calendar
+                or out_of_coverage
                 or not source_consistent
                 or not source_complete
             ):
@@ -322,6 +406,12 @@ class DailyBarDataQualityService:
                     source_consistent=source_consistent,
                     source_complete=source_complete,
                     missing_source_row_count=missing_source_rows,
+                    max_missing_streak=longest_missing_streak,
+                    missing_session_ranges=tuple(missing_ranges),
+                    calendar_out_of_coverage_date_count=len(out_of_coverage),
+                    calendar_out_of_coverage_dates=tuple(
+                        item.isoformat() for item in out_of_coverage
+                    ),
                 )
             )
 
@@ -373,6 +463,7 @@ class DailyBarDataQualityService:
             overall_ok = False
 
         common_ordered = tuple(sorted(common))
+        calendar_coverage = self.calendar.coverage
         return DailyDataQualitySummary(
             schema_version=3,
             status="ok" if overall_ok else "degraded",
@@ -402,6 +493,16 @@ class DailyBarDataQualityService:
             missing_source_symbols=missing_source_symbols,
             source_consistent=source_consistent,
             symbols=tuple(results),
+            calendar_coverage_start=(
+                calendar_coverage[0].isoformat() if calendar_coverage else None
+            ),
+            calendar_coverage_end=(
+                calendar_coverage[1].isoformat() if calendar_coverage else None
+            ),
+            calendar_fingerprint=getattr(self.calendar, "fingerprint", None),
+            max_missing_streak=max(
+                (item.max_missing_streak for item in results), default=0
+            ),
         )
 
 

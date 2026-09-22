@@ -35,6 +35,16 @@ $env:QUANT_MONITOR_DATA_PROVIDER = "mock"
 # AShareHub 真实链路冒烟检查（显式执行；固定单代码、一次实时请求）
 set "QUANT_MONITOR_ASHAREHUB_API_KEY=替换为本机key"
 .\.venv\Scripts\python.exe scripts\smoke_asharehub.py --symbols 600519.SH
+
+# 研究包离线完整性校验（不访问数据库、网络或行情源）
+.\.venv\Scripts\python.exe scripts\verify_research_export.py research-run.json --require-result
+
+# 已授权基本面事实的离线导入（先校验，不访问 provider）
+.\.venv\Scripts\python.exe scripts\import_fundamentals.py data\quant_monitor_asharehub.db fundamentals.json --dry-run
+.\.venv\Scripts\python.exe scripts\import_fundamentals.py data\quant_monitor_asharehub.db fundamentals.json
+# 本地服务就绪探针（仅访问本机 /ready，不消耗上游额度）
+scripts\healthcheck.cmd --wait 60 --provider asharehub
+scripts\healthcheck.cmd --wait 60 --provider asharehub --require-calendar
 ```
 
 - 打包：`pyproject.toml` 使用 setuptools；`pip install .` 后提供 `quant-monitor` 命令入口。
@@ -53,6 +63,7 @@ quant_monitor/
   domain/            纯领域模型与进程内事件，仅用标准库
   data_sources/      MarketDataProvider 协议；asharehub.py（默认 HTTP）、alltick.py、akshare.py 与 mock.py
   storage/           sqlite.py：WAL、幂等 upsert；migrations/：版本迁移、checksum 和回滚保护
+  research/          manifest、lineage、治理、离线 replay 与 as-of 银行基本面因子
   services/          collection（采集编排）、indicators（SMA/EMA/RSI 等纯计算）、
                      event_bus（单进程发布订阅）、monitoring（轮询、策略求值、告警）
   strategies/        Strategy 协议、注册表、均线交叉示例（MovingAverageCrossStrategy）
@@ -93,8 +104,8 @@ scripts/             Windows/POSIX 启动脚本及显式真实链路冒烟脚本
 ## 已知边界（不要"顺手修复"）
 
 - `market.py` 的交易日历是周一至周五兜底，明确标注 `weekday_fallback`，不识别的节假日/停牌属于待接入生产数据的既定工作。
-- SQLite 当前 `SCHEMA_VERSION = 3`，已有顺序迁移执行器；改 schema 必须增加新迁移并保持历史 checksum 不变，不能只改初始化 DDL。
+- SQLite 当前 `SCHEMA_VERSION = 9`，已有顺序迁移执行器；v6 持久化采集作业与幂等摘要，v7 追加不可变基本面观测及 as-of 查询，v8 追加不可变公司行动与版本化复权因子，v9 追加不可变 point-in-time 股票池快照及 as-of 查询。改 schema 必须增加新迁移并保持历史 checksum 不变，不能只改初始化 DDL。
 - upsert 唯一键不含 `source`；多源行情会相互覆盖，接入多源前需先定权威源。
-- 信号去重仅在进程内，重启/回放可能重复。
+- 信号业务键由策略、证券、动作和事件时间组成；监控器会在进程内缓存之外查询 SQLite 历史，重启/回放不会重复发布同一键。多个采集主节点并发写入仍被架构约束禁止；跨进程部署前需升级为原子唯一 claim。
 - AShareHub 免费档为 100 次请求/日；本地默认 90 次软预算、实时报价 300 秒缓存、日线 24 小时缓存、证券目录 7 天缓存。预算使用跨进程锁原子持久化，主服务和显式冒烟共用。不得把 pytest、CI 或启动流程改成自动访问真实接口，也不要绕过持久化日预算。
 - AShareHub 当前文档没有官方股票 WebSocket、逐笔成交、五档盘口或分钟 K 线；`/ws/market` 只是本地事件推送，不能标成供应商实时流。

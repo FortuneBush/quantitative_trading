@@ -11,8 +11,34 @@ from pathlib import Path
 from threading import Timer
 
 import uvicorn
+from uvicorn.logging import AccessFormatter
 
 from quant_monitor.config import load_settings
+
+
+class SafeAccessFormatter(AccessFormatter):
+    """Render access logs without query strings or credential-bearing values."""
+
+    def formatMessage(self, record):  # noqa: N802 - logging API name
+        # Uvicorn stores ``(client, method, full_path, version, status)`` in
+        # the record args.  ``full_path`` may include provider tokens when a
+        # third-party adapter uses a query parameter, so retain only the path
+        # before delegating to the stock formatter.  This also keeps the
+        # existing timestamp/status formatting and does not mutate the record
+        # shared with other handlers.
+        record_copy = copy.copy(record)
+        args = record_copy.args
+        if isinstance(args, tuple) and len(args) == 5:
+            client_addr, method, full_path, http_version, status_code = args
+            safe_path = str(full_path).split("?", 1)[0]
+            record_copy.args = (
+                client_addr,
+                method,
+                safe_path,
+                http_version,
+                status_code,
+            )
+        return super().formatMessage(record_copy)
 
 
 def _build_uvicorn_log_config():
@@ -26,6 +52,8 @@ def _build_uvicorn_log_config():
         '%(asctime)s %(levelprefix)s %(name)s: %(client_addr)s - '
         '"%(request_line)s" %(status_code)s'
     )
+    config["formatters"]["access"]["()"] = "quant_monitor.main.SafeAccessFormatter"
+    config["formatters"]["access"].pop("class", None)
     return config
 
 

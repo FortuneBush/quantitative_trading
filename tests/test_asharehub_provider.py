@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -24,6 +25,7 @@ from quant_monitor.data_sources.asharehub import (
     _HTTPStatusError,
 )
 from quant_monitor.domain import Bar, SHANGHAI_TZ
+from quant_monitor.trading_calendar import DEFAULT_TRADING_CALENDAR, VersionedSessionCalendar
 
 
 TEST_KEY = "unit-test-key-sentinel"
@@ -164,6 +166,392 @@ def test_realtime_basket_auth_mapping_timezone_cache_and_status(tmp_path):
     assert status["subscribed_symbols"] == 2
 
 
+def test_trade_calendar_holiday_avoids_quote_request_and_exposes_source(tmp_path):
+    async def exercise():
+        clock = Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ))
+
+        class CalendarRequester(Requester):
+            def __call__(self, method, url, headers, params, timeout):
+                self.calls.append((method, url, dict(headers), dict(params), timeout))
+                if url.endswith("/v2/reference/trade-calendar"):
+                    exchange = params["exchange"]
+                    return [
+                        {
+                            "exchange": exchange,
+                            "cal_date": "20261005",
+                            "is_open": 0,
+                            "pretrade_date": "20260930",
+                        },
+                        {
+                            "exchange": exchange,
+                            "cal_date": "20260930",
+                            "is_open": 1,
+                            "pretrade_date": "20260929",
+                        },
+                    ]
+                raise AssertionError("holiday must not request realtime")
+
+        requester = CalendarRequester()
+        target = provider(
+            tmp_path,
+            requester,
+            clock,
+            trade_calendar_enabled=True,
+            trade_calendar_cache_seconds=604800,
+        )
+        with pytest.raises(AShareHubDataError, match="600519.SH"):
+            await target.fetch_quotes(["600519.SH"])
+        status = target.realtime_status
+        await target.close()
+        return requester.calls, status
+
+    calls, status = asyncio.run(exercise())
+    assert len(calls) == 2
+    assert {call[3]["exchange"] for call in calls} == {"SSE", "SZSE"}
+    assert status["trade_calendar_source"] == "asharehub"
+    assert status["trade_calendar_error_type"] is None
+    assert status["requests_used_today"] == 2
+
+
+def test_trade_calendar_conflicting_duplicate_rows_fail_closed(tmp_path):
+    """Wire ordering must not decide whether a date is open or closed."""
+
+    clock = Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ))
+    requester = Requester(
+        {
+            "/v2/reference/trade-calendar": [
+                {"exchange": "SSE", "cal_date": "20261005", "is_open": 0},
+                # Same date, contradictory status: reject the exchange data.
+                {"exchange": "SSE", "cal_date": "20261005", "is_open": 1},
+            ]
+        }
+    )
+    target = provider(
+        tmp_path,
+        requester,
+        clock,
+        trade_calendar_enabled=True,
+        trade_calendar_path=tmp_path / "calendar.json",
+    )
+
+    async def exercise():
+        await target._ensure_trade_calendar()
+        status = dict(target.realtime_status)
+        await target.close()
+        return status
+
+    status = asyncio.run(exercise())
+    assert status["trade_calendar_source"] == "weekday_fallback"
+    assert status["trade_calendar_error_type"] == "AShareHubDataError"
+    assert status["requests_used_today"] == 1
+
+
+def test_trade_calendar_cache_conflicting_duplicate_rows_is_discarded(tmp_path):
+    clock = Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ))
+    calendar_path = tmp_path / "calendar.json"
+    calendar_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "saved_at": "2026-10-05T09:00:00+08:00",
+                "rows": [
+                    {"exchange": "SSE", "cal_date": "20261005", "is_open": 0},
+                    {"exchange": "SSE", "cal_date": "20261005", "is_open": 1},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target = provider(
+        tmp_path,
+        Requester(failure=RuntimeError("cache should be discarded")),
+        clock,
+        trade_calendar_enabled=True,
+        trade_calendar_path=calendar_path,
+    )
+    status = dict(target.realtime_status)
+    assert status["trade_calendar_source"] == "weekday_fallback"
+    assert status["trade_calendar_error_type"] == "TradeCalendarCacheError"
+    asyncio.run(target.close())
+
+
+def test_trade_calendar_cache_is_reused_without_budget_or_network(tmp_path):
+    async def exercise():
+        clock = Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ))
+        class CalendarRequester(Requester):
+            def __call__(self, method, url, headers, params, timeout):
+                self.calls.append((method, url, dict(headers), dict(params), timeout))
+                exchange = params["exchange"]
+                return [{
+                    "exchange": exchange,
+                    "cal_date": "20261005",
+                    "is_open": 0,
+                    "pretrade_date": "20260930",
+                }]
+
+        first_requester = CalendarRequester()
+        target = provider(
+            tmp_path,
+            first_requester,
+            clock,
+            trade_calendar_enabled=True,
+            trade_calendar_cache_seconds=604800,
+            trade_calendar_path=tmp_path / "calendar.json",
+        )
+        await target._ensure_trade_calendar()
+        await target.close()
+
+        second_requester = Requester(failure=RuntimeError("must not call"))
+        restored = provider(
+            tmp_path,
+            second_requester,
+            clock,
+            trade_calendar_enabled=True,
+            trade_calendar_cache_seconds=604800,
+            trade_calendar_path=tmp_path / "calendar.json",
+        )
+        source = restored.realtime_status["trade_calendar_source"]
+        await restored._ensure_trade_calendar()
+        status = restored.realtime_status
+        await restored.close()
+        return source, status, first_requester.calls, second_requester.calls
+
+    source, status, first_calls, second_calls = asyncio.run(exercise())
+    assert source == "asharehub_cache"
+    assert status["trade_calendar_source"] == "asharehub_cache"
+    assert len(first_calls) == 2
+    assert second_calls == []
+
+
+def test_loaded_trade_calendar_exposes_immutable_versioned_view_without_network(tmp_path):
+    """The finite exchange cache is the same calendar contract research uses."""
+
+    class CalendarRequester(Requester):
+        def __call__(self, method, url, headers, params, timeout):
+            self.calls.append((method, url, dict(headers), dict(params), timeout))
+            exchange = params["exchange"]
+            return [
+                {"exchange": exchange, "cal_date": "20261002", "is_open": 1},
+                {"exchange": exchange, "cal_date": "20261003", "is_open": 1},
+                {"exchange": exchange, "cal_date": "20261005", "is_open": 0},
+                {"exchange": exchange, "cal_date": "20261006", "is_open": 1},
+            ]
+
+    async def exercise():
+        target = provider(
+            tmp_path,
+            CalendarRequester(),
+            Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ)),
+            trade_calendar_enabled=True,
+        )
+        await target._ensure_trade_calendar()
+        calendar = target.get_trading_calendar()
+        await target.close()
+        return calendar
+
+    calendar = asyncio.run(exercise())
+    assert isinstance(calendar, VersionedSessionCalendar)
+    assert calendar.metadata.identifier == "asharehub_trade_calendar"
+    assert calendar.metadata.version == "asharehub-trade-calendar-v1"
+    assert calendar.is_session(datetime(2026, 10, 2).date())
+    assert calendar.is_session(datetime(2026, 10, 3).date())
+    assert not calendar.is_session(datetime(2026, 10, 5).date())
+    assert len(calendar.fingerprint) == 64
+
+
+def test_partial_exchange_calendar_falls_back_for_mixed_research_scope(tmp_path):
+    """A mixed SSE/SZSE quality scope cannot use one-sided vendor evidence."""
+
+    target = provider(
+        tmp_path,
+        Requester(),
+        Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ)),
+        trade_calendar_enabled=True,
+    )
+    target._trade_calendar_loaded_at = target._monotonic()
+    target._trade_calendar["SSE"] = {
+        datetime(2026, 10, 2).date(): (True, None),
+    }
+    # SZSE intentionally has no rows: do not promote the SSE-only calendar.
+    assert target.get_trading_calendar() is DEFAULT_TRADING_CALENDAR
+    asyncio.run(target.close())
+
+
+def test_expired_trade_calendar_cache_is_reported_and_not_used(tmp_path):
+    clock = Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ))
+    calendar_path = tmp_path / "calendar.json"
+
+    async def seed():
+        target = provider(
+            tmp_path,
+            Requester({
+                "/v2/reference/trade-calendar": [
+                    {"exchange": "SSE", "cal_date": "20261005", "is_open": 0},
+                    {"exchange": "SZSE", "cal_date": "20261005", "is_open": 0},
+                ]
+            }),
+            clock,
+            trade_calendar_enabled=True,
+            trade_calendar_cache_seconds=60,
+            trade_calendar_path=calendar_path,
+        )
+        await target._ensure_trade_calendar()
+        await target.close()
+
+    asyncio.run(seed())
+    payload = json.loads(calendar_path.read_text(encoding="utf-8"))
+    payload["saved_at"] = "2026-10-04T09:00:00+08:00"
+    calendar_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    restored = provider(
+        tmp_path,
+        Requester(failure=RuntimeError("expired cache must not be trusted")),
+        clock,
+        trade_calendar_enabled=True,
+        trade_calendar_cache_seconds=60,
+        trade_calendar_path=calendar_path,
+    )
+    status = dict(restored.realtime_status)
+    assert status["trade_calendar_source"] == "weekday_fallback"
+    assert status["trade_calendar_error_type"] == "TradeCalendarCacheExpired"
+    asyncio.run(restored.close())
+
+
+def test_trade_calendar_respects_callers_reserved_budget(tmp_path):
+    async def exercise():
+        clock = Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ))
+        requester = Requester(failure=RuntimeError("calendar must be skipped"))
+        target = provider(
+            tmp_path,
+            requester,
+            clock,
+            daily_soft_limit=3,
+            trade_calendar_enabled=True,
+        )
+        await target._ensure_trade_calendar(reserve_requests=1)
+        status = target.realtime_status
+        await target.close()
+        return status, requester.calls
+
+    status, calls = asyncio.run(exercise())
+    assert calls == []
+    assert status["trade_calendar_source"] == "weekday_fallback_budget_reserved"
+    assert status["trade_calendar_error_type"] == "TradeCalendarBudgetReserved"
+
+
+def test_current_market_status_applies_cached_holiday_without_network(tmp_path):
+    async def exercise():
+        clock = Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ))
+
+        class CalendarRequester(Requester):
+            def __call__(self, method, url, headers, params, timeout):
+                self.calls.append((method, url, dict(headers), dict(params), timeout))
+                return [{
+                    "exchange": params["exchange"],
+                    "cal_date": "20261005",
+                    "is_open": 0,
+                    "pretrade_date": "20260930",
+                }]
+
+        requester = CalendarRequester()
+        target = provider(
+            tmp_path,
+            requester,
+            clock,
+            trade_calendar_enabled=True,
+        )
+        await target._ensure_trade_calendar()
+        status = target.current_market_status()
+        await target.close()
+        return status
+
+    status = asyncio.run(exercise())
+    assert status["is_trading"] is False
+    assert status["is_trading_day"] is False
+    assert status["label"] == "节假日休市"
+    assert status["calendar"] == "asharehub"
+    assert status["calendar_source"] == "asharehub"
+    assert status["calendar_version"] == "asharehub-trade-calendar-v1"
+    assert status["calendar_verified"] is False
+    assert status["calendar_exchange"] == "SSE"
+    assert status["calendar_lookup"] == "closed"
+
+
+def test_trade_calendar_makeup_saturday_overrides_weekday_fallback(tmp_path):
+    clock = Clock(datetime(2026, 10, 3, 10, 0, tzinfo=SHANGHAI_TZ))  # Saturday
+    requester = Requester(
+        {
+            "/v2/reference/trade-calendar": [
+                {"exchange": "SSE", "cal_date": "20261003", "is_open": 1},
+                {"exchange": "SZSE", "cal_date": "20261003", "is_open": 1},
+            ],
+            "/v2/market/realtime": [quote_row(trade_time="2026-10-03T10:00:00")],
+        }
+    )
+
+    async def exercise():
+        target = provider(
+            tmp_path,
+            requester,
+            clock,
+            trade_calendar_enabled=True,
+            trade_calendar_path=tmp_path / "calendar.json",
+        )
+        await target._ensure_trade_calendar()
+        status = target.current_market_status()
+        rows = await target.fetch_quotes(["600519.SH"])
+        await target.close()
+        return status, rows
+
+    status, rows = asyncio.run(exercise())
+    assert status["is_trading_day"] is True
+    assert status["is_trading"] is True
+    assert status["phase"] == "morning"
+    assert status["calendar"] == "asharehub"
+    assert status["calendar_source"] == "asharehub"
+    assert status["calendar_version"] == "asharehub-trade-calendar-v1"
+    assert status["calendar_verified"] is False
+    assert status["calendar_exchange"] == "SSE"
+    assert status["calendar_lookup"] == "open"
+    assert [item.symbol for item in rows] == ["600519.SH"]
+    assert sum(1 for call in requester.calls if call[1].endswith("/v2/market/realtime")) == 1
+
+
+def test_trade_calendar_outside_cached_coverage_is_disclosed_as_unknown(tmp_path):
+    """A bounded cache must not look like an exchange-confirmed weekday."""
+
+    clock = Clock(datetime(2026, 10, 5, 10, 0, tzinfo=SHANGHAI_TZ))
+    requester = Requester(
+        {
+            "/v2/reference/trade-calendar": [
+                {"exchange": "SSE", "cal_date": "20261001", "is_open": 0},
+                {"exchange": "SZSE", "cal_date": "20261001", "is_open": 0},
+            ]
+        }
+    )
+
+    async def exercise():
+        target = provider(
+            tmp_path,
+            requester,
+            clock,
+            trade_calendar_enabled=True,
+            trade_calendar_path=tmp_path / "calendar.json",
+        )
+        await target._ensure_trade_calendar()
+        status = target.current_market_status()
+        await target.close()
+        return status
+
+    status = asyncio.run(exercise())
+    # 2026-10-05 is a weekday, but the fixture does not cover it.  The
+    # provider must disclose the unknown lookup instead of claiming the
+    # AShareHub snapshot answered the question.
+    assert status["calendar"] == "weekday_fallback"
+    assert status["calendar_lookup"] == "unknown"
+    assert "no row" in status["calendar_notice"]
+
+
 def test_quotes_strict_and_relaxed_missing_semantics_share_cached_attempt(tmp_path):
     async def exercise():
         requester = Requester({"/v2/market/realtime": [quote_row()]})
@@ -192,9 +580,120 @@ def test_invalid_realtime_rows_are_not_fabricated(tmp_path):
         target = provider(tmp_path, requester)
         with pytest.raises(AShareHubDataError, match="600519.SH, 000001.SZ"):
             await target.fetch_quotes(["600519.SH", "000001.SZ"])
+        status = dict(target.realtime_status)
         await target.close()
+        return status
 
-    asyncio.run(exercise())
+    status = asyncio.run(exercise())
+    assert status["last_quote_response_rows"] == 2
+    assert status["last_quote_parsed_symbols"] == 0
+    assert status["last_quote_dropped_rows"] == 2
+    assert status["last_quote_missing_symbols"] == ["600519.SH", "000001.SZ"]
+
+
+def test_realtime_status_exposes_partial_payload_quality(tmp_path):
+    async def exercise():
+        requester = Requester(
+            {"/v2/market/realtime": [quote_row(), quote_row("000001.SZ", price="bad")]}
+        )
+        target = provider(tmp_path, requester)
+        rows = await target.fetch_quotes_relaxed(["600519.SH", "000001.SZ"])
+        status = dict(target.realtime_status)
+        await target.close()
+        return rows, status
+
+    rows, status = asyncio.run(exercise())
+    assert [item.symbol for item in rows] == ["600519.SH"]
+    assert status["last_quote_response_rows"] == 2
+    assert status["last_quote_parsed_symbols"] == 1
+    assert status["last_quote_dropped_rows"] == 1
+    assert status["last_quote_missing_symbols"] == ["000001.SZ"]
+
+
+def test_realtime_payload_quality_counters_classify_invalid_unexpected_and_duplicate_rows(tmp_path):
+    async def exercise():
+        rows = [
+            quote_row(),
+            # A second observation for the same symbol is valid but duplicate;
+            # the newest timestamp wins deterministically.
+            quote_row(price="1501.00", trade_time="2026-08-28T10:01:03"),
+            quote_row("000001.SZ", price="bad"),
+            quote_row("600000.SH"),
+            {"symbol": "not-a-symbol", "price": "10"},
+        ]
+        target = provider(tmp_path, Requester({"/v2/market/realtime": rows}))
+        result = await target.fetch_quotes_relaxed(["600519.SH", "000001.SZ"])
+        status = dict(target.realtime_status)
+        await target.close()
+        return result, status
+
+    result, status = asyncio.run(exercise())
+    assert [item.symbol for item in result] == ["600519.SH"]
+    assert status["last_quote_response_rows"] == 5
+    assert status["last_quote_parsed_symbols"] == 1
+    assert status["last_quote_dropped_rows"] == 4
+    assert status["last_quote_invalid_rows"] == 2
+    assert status["last_quote_unexpected_rows"] == 1
+    assert status["last_quote_duplicate_rows"] == 1
+
+
+def test_realtime_conflicting_same_timestamp_rows_fail_closed(tmp_path):
+    """Wire order must not choose between ambiguous same-time revisions."""
+
+    async def exercise():
+        rows = [
+            quote_row(price="1500.25", trade_time="2026-08-28T10:01:02"),
+            quote_row(price="1501.00", trade_time="2026-08-28T10:01:02"),
+        ]
+        target = provider(tmp_path, Requester({"/v2/market/realtime": rows}))
+        with pytest.raises(
+            AShareHubDataError,
+            match="conflicting duplicate rows.*600519.SH",
+        ):
+            await target.fetch_quotes(["600519.SH"])
+        status = dict(target.realtime_status)
+        await target.close()
+        return status
+
+    status = asyncio.run(exercise())
+    assert status["last_quote_conflict_rows"] == 1
+    assert status["last_quote_parsed_symbols"] is None
+    assert status["last_quote_missing_symbols"] == []
+
+
+def test_realtime_older_response_cannot_overwrite_cached_quote(tmp_path):
+    """An out-of-order snapshot preserves the latest usable cache value."""
+
+    class SequencedRequester:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                [quote_row(price="1500.25", trade_time="2026-08-28T10:01:02")],
+                [quote_row(price="1499.00", trade_time="2026-08-28T09:59:00")],
+            ]
+
+        def __call__(self, method, url, headers, params, timeout):
+            self.calls.append((method, url, dict(headers), dict(params), timeout))
+            return self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
+
+    async def exercise():
+        requester = SequencedRequester()
+        target = provider(tmp_path, requester, quote_cache_seconds=0)
+        first = await target.fetch_quotes(["600519.SH"])
+        with pytest.raises(AShareHubDataError, match="600519.SH"):
+            await target.fetch_quotes(["600519.SH"])
+        status = dict(target.realtime_status)
+        cached = target._quotes["600519.SH"]
+        await target.close()
+        return first, cached, status, requester.calls
+
+    first, cached, status, calls = asyncio.run(exercise())
+    assert first[0].last == Decimal("1500.25")
+    assert cached.last == Decimal("1500.25")
+    assert cached.timestamp.isoformat() == "2026-08-28T10:01:02+08:00"
+    assert status["last_quote_stale_rows"] == 1
+    assert status["last_quote_missing_symbols"] == ["600519.SH"]
+    assert len(calls) == 2
 
 
 def test_quote_cache_singleflight_for_concurrent_callers(tmp_path):
@@ -218,6 +717,45 @@ def test_quote_cache_singleflight_for_concurrent_callers(tmp_path):
     calls, batches = asyncio.run(exercise())
     assert len(calls) == 1
     assert batches[0] == batches[1]
+
+
+def test_budget_lock_wait_does_not_freeze_asyncio_loop(tmp_path):
+    """A contended local quota lock must leave health/heartbeat tasks runnable."""
+
+    async def exercise():
+        requester = Requester({"/v2/market/realtime": [quote_row()]})
+        target = provider(tmp_path, requester)
+        reservation_started = threading.Event()
+        released_by_heartbeat = threading.Event()
+        release = threading.Event()
+
+        def blocked_reservation(*, reserve_requests=0):
+            del reserve_requests
+            reservation_started.set()
+            # Simulate another process holding the persistent budget lock.
+            # The heartbeat task below must be able to release us; a timer is
+            # only a safety valve so a regression cannot hang the test suite.
+            release.wait(1.0)
+
+        target._consume_budget = blocked_reservation
+
+        async def heartbeat():
+            await asyncio.to_thread(reservation_started.wait, 0.5)
+            released_by_heartbeat.set()
+            release.set()
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        fetch_task = asyncio.create_task(target.fetch_quotes(["600519.SH"]))
+        try:
+            await asyncio.wait_for(fetch_task, timeout=1.5)
+            await asyncio.wait_for(heartbeat_task, timeout=0.5)
+            return released_by_heartbeat.is_set()
+        finally:
+            release.set()
+            await asyncio.gather(fetch_task, heartbeat_task, return_exceptions=True)
+            await target.close()
+
+    assert asyncio.run(exercise()) is True
 
 
 def test_closed_market_performs_at_most_one_quote_attempt_even_on_failure(tmp_path):
@@ -312,6 +850,39 @@ def test_daily_bars_units_order_dates_filters_and_cache(tmp_path):
     assert first[0].turnover == Decimal("185123456.000")
     assert first[0].source == "asharehub"
     assert second == [first[-1]]
+
+
+def test_daily_bars_reject_conflicting_duplicate_session_rows(tmp_path):
+    """A duplicate session with different OHLCV must fail closed.
+
+    Silently keeping the last duplicate would make the persisted observation
+    depend on vendor row ordering and hide a data-quality incident. Identical
+    duplicate rows remain harmlessly deduplicated by the adapter.
+    """
+
+    async def exercise():
+        clock = Clock(datetime(2026, 8, 28, 16, 0, tzinfo=SHANGHAI_TZ))
+        duplicate = daily_row(trade_date="20260827")
+        conflicting = dict(duplicate, close="1499.99")
+        requester = Requester({"/v2/market/daily": [duplicate, conflicting]})
+        target = provider(tmp_path, requester, clock)
+        with pytest.raises(
+            AShareHubDataError,
+            match="conflicting duplicate rows.*2026-08-27",
+        ):
+            await target.fetch_bars_with_lineage(
+                "600519.SH",
+                interval="1d",
+                start=datetime(2026, 8, 27, tzinfo=SHANGHAI_TZ),
+                end=datetime(2026, 8, 27, tzinfo=SHANGHAI_TZ),
+                limit=10,
+            )
+        # Failed parsing must not leave a cache entry that can be served as if
+        # the ambiguous response had been accepted.
+        assert target._bar_cache == {}
+        await target.close()
+
+    asyncio.run(exercise())
 
 
 def _seeded_daily_rows(count, latest_date):
@@ -446,6 +1017,42 @@ def test_cached_preclose_empty_check_refreshes_again_after_expected_date_advance
     assert len(calls) == 2
     assert first[-1].timestamp.strftime("%Y%m%d") == "20260827"
     assert second[-1].timestamp.strftime("%Y%m%d") == "20260828"
+
+
+def test_daily_response_does_not_accept_current_partial_bar_before_close(tmp_path):
+    """A daily row is unavailable until its conservative 15:30 watermark."""
+
+    async def exercise():
+        clock = Clock(datetime(2026, 8, 28, 10, 0, tzinfo=SHANGHAI_TZ))
+        requester = Requester(
+            {"/v2/market/daily": [daily_row(trade_date="20260828")]}
+        )
+        target = provider(tmp_path, requester, clock)
+        with pytest.raises(AShareHubDataError, match="no usable rows"):
+            await target.fetch_bars("600519.SH", interval="1d", limit=1)
+        status = dict(target.realtime_status)
+        await target.close()
+        return status
+
+    status = asyncio.run(exercise())
+    assert status["last_bar_future_rows"] == 1
+
+
+def test_daily_response_accepts_current_bar_at_after_close_watermark(tmp_path):
+    async def exercise():
+        clock = Clock(datetime(2026, 8, 28, 15, 30, tzinfo=SHANGHAI_TZ))
+        requester = Requester(
+            {"/v2/market/daily": [daily_row(trade_date="20260828")]}
+        )
+        target = provider(tmp_path, requester, clock)
+        bars = await target.fetch_bars("600519.SH", interval="1d", limit=1)
+        status = dict(target.realtime_status)
+        await target.close()
+        return bars, status
+
+    bars, status = asyncio.run(exercise())
+    assert bars[-1].timestamp.isoformat() == "2026-08-28T15:30:00+08:00"
+    assert status["last_bar_future_rows"] == 0
 
 
 @pytest.mark.parametrize(
@@ -783,6 +1390,7 @@ def test_operation_specific_success_timestamps_do_not_mislabel_daily_as_quote(tm
     "status,error_type",
     [
         (401, AShareHubAuthenticationError),
+        (403, AShareHubPermissionError),
         (429, AShareHubRateLimitError),
         (422, AShareHubRequestError),
         (503, AShareHubTransportError),
@@ -808,7 +1416,6 @@ def test_http_status_classification_is_sanitized(tmp_path, status, error_type):
     "status,error_type",
     [
         (401, AShareHubAuthenticationError),
-        (403, AShareHubPermissionError),
         (429, AShareHubRateLimitError),
     ],
 )
@@ -872,6 +1479,44 @@ def test_vendor_429_status_distinguishes_upstream_from_local_budget(tmp_path):
     assert snapshot["upstream_quota_exhausted"] is True
     assert snapshot["local_budget_exhausted"] is False
     assert snapshot["requests_remaining_soft"] == 89
+
+
+def test_realtime_permission_circuit_does_not_block_daily_history(tmp_path):
+    """A plan may deny realtime while still allowing the daily endpoint."""
+
+    class EndpointPermissions:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, method, url, headers, params, timeout):
+            path = url.removeprefix(ASHAREHUB_BASE_URL)
+            self.calls.append(path)
+            if path == "/v2/market/realtime":
+                raise _HTTPStatusError(403)
+            if path == "/v2/market/daily":
+                return [daily_row()]
+            return []
+
+    async def exercise():
+        requester = EndpointPermissions()
+        target = provider(tmp_path, requester)
+        with pytest.raises(AShareHubPermissionError):
+            await target.fetch_quotes(["600519.SH"])
+        bars = await target.fetch_bars(
+            "600519.SH", interval="1d", limit=1
+        )
+        # The realtime circuit remains open for that operation, avoiding a
+        # repeated paid call, while an allowed history endpoint still works.
+        with pytest.raises(AShareHubPermissionError):
+            await target.fetch_quotes(["600519.SH"])
+        status = dict(target.realtime_status)
+        await target.close()
+        return requester.calls, bars, status
+
+    calls, bars, status = asyncio.run(exercise())
+    assert calls == ["/v2/market/realtime", "/v2/market/daily"]
+    assert len(bars) == 1
+    assert status["permission_circuit_open"] is True
 
 
 def test_default_zero_retries_and_explicit_retry_each_consume_budget(tmp_path):

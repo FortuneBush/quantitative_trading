@@ -32,7 +32,7 @@
           <span id="ws-status" class="status-pill neutral" title="浏览器到本地服务的增量推送通道；不代表上游供应商提供 WebSocket"><i></i><span>本地推送连接中</span></span>
           <span id="provider-status" class="status-pill neutral" title="本地服务访问上游行情 API 的状态"><i></i><span>行情源检查中</span></span>
         </div>
-        <button id="refresh-all" class="icon-button" type="button" title="刷新全部数据" aria-label="刷新全部数据">
+        <button id="refresh-all" class="icon-button" type="button" title="刷新本地缓存视图（不主动消耗额度）" aria-label="刷新本地缓存视图">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"/><path d="M19 11a7.5 7.5 0 1 0 .1 4"/></svg>
         </button>
       </div>
@@ -46,6 +46,10 @@
           <p id="last-updated" class="muted">正在连接本地数据服务…</p>
         </div>
         <div class="hero-actions">
+          <button id="collect-now" class="secondary-button" type="button" title="主动请求一次最新行情，可能消耗数据源额度">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13.7-5.6L20 8.7"/><path d="M20 4v4.7h-4.7"/><path d="M20 12a8 8 0 0 1-13.7 5.6L4 15.3"/><path d="M4 20v-4.7h4.7"/></svg>
+            采集最新行情
+          </button>
           <button id="open-settings" class="secondary-button" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.08A1.7 1.7 0 0 0 8.96 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15 1.7 1.7 0 0 0 3.08 14H3v-4h.08A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3.08V3h4v.08A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9 1.7 1.7 0 0 0 20.92 10H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></svg>
             数据设置
@@ -123,7 +127,7 @@
               <ol id="market-research" class="leader-list"><li class="leader-empty">等待量化分析</li></ol>
             </section>
           </div>
-          <p id="market-insights-note" class="panel-note">银行分类、行情覆盖率与排名均来自服务端聚合缓存；筛选和排序不会额外消耗 API 额度。</p>
+          <p id="market-insights-note" class="panel-note" aria-live="polite">银行分类、行情覆盖率与排名均来自服务端聚合缓存；筛选和排序不会额外消耗 API 额度。</p>
         </section>
 
         <section class="panel analysis-panel" aria-labelledby="analysis-title">
@@ -136,8 +140,14 @@
           </header>
           <div id="analysis-summary" class="analysis-summary" aria-live="polite">
             <div class="analysis-verdict"><span class="analysis-label">研究偏向</span><strong id="analysis-verdict-value">—</strong><small id="analysis-verdict-note">选择银行股后读取缓存分析</small></div>
-            <div class="analysis-score"><span class="analysis-label">趋势分数</span><strong id="analysis-score-value">—</strong><small>规则化研究指标，不是收益承诺</small></div>
+            <div class="analysis-score"><span id="analysis-score-label" class="analysis-label">趋势分数</span><strong id="analysis-score-value">—</strong><small>规则化研究指标，不是收益承诺</small></div>
             <div class="analysis-score"><span class="analysis-label">风险等级</span><strong id="analysis-risk-value">—</strong><small id="analysis-risk-note">等待波动率</small></div>
+          </div>
+          <div id="analysis-quality" class="analysis-quality" aria-label="研究数据质量" aria-live="polite">
+            <span id="analysis-quality-status" class="quality-chip neutral">数据质量 —</span>
+            <span id="analysis-quality-coverage" class="quality-chip neutral">样本 —</span>
+            <span id="analysis-quality-asof" class="quality-chip neutral">日线截至 —</span>
+            <span id="analysis-entry-gate" class="quality-chip neutral">入场门控 —</span>
           </div>
           <div id="analysis-metrics" class="analysis-metrics" aria-live="polite">
             <div><span>相对 120 日均线</span><strong>—</strong></div>
@@ -152,6 +162,8 @@
             <section><h3>主要风险</h3><ul id="analysis-risks"><li>等待风险指标与数据质量</li></ul></section>
             <section><h3>失效条件</h3><ul id="analysis-invalidations"><li>等待策略提供明确失效条件</li></ul></section>
           </div>
+          <div id="analysis-factor-breakdown" class="analysis-factor-breakdown" aria-live="polite"></div>
+          <section id="bank-fundamentals" class="bank-fundamentals" aria-label="银行基本面事实与独立研究评分" aria-live="polite" hidden></section>
           <p id="analysis-note" class="panel-note">板块页优先使用服务端已缓存的分析，不会自动逐只请求历史数据；所有结论仅供研究观察，不构成投资建议。</p>
         </section>
       </section>
@@ -197,6 +209,7 @@
           </header>
           <div id="chart-summary" class="chart-summary" aria-live="polite">
             <strong id="selected-price">—</strong><span id="selected-change" class="muted">等待行情</span>
+            <span id="chart-provenance" class="chart-provenance neutral" title="K 线数据的缓存与可追溯性状态">K 线来源 —</span>
             <span class="legend"><i class="ma5"></i>MA5 <i class="ma20"></i>MA20</span>
           </div>
           <div id="chart-wrap" class="chart-wrap">
@@ -250,6 +263,25 @@
           <div class="system-foot"><span id="heartbeat-dot" class="heartbeat"></span><span id="heartbeat-text">等待服务心跳</span></div>
         </section>
       </div>
+
+      <section class="panel research-runs-panel" aria-labelledby="research-runs-title">
+        <header class="panel-header">
+          <div>
+            <p class="panel-kicker">RESEARCH LAB</p>
+            <h2 id="research-runs-title">研究运行与结果对比 <small>本地不可变记录</small></h2>
+          </div>
+          <span id="research-runs-count" class="count-badge">读取中</span>
+        </header>
+        <div class="research-runs-toolbar">
+          <p id="research-runs-note" class="panel-note">仅读取 SQLite 中已保存的研究运行，不访问行情源；勾选至少两条运行即可比较。</p>
+          <button id="research-compare" class="secondary-button" type="button" disabled>比较选中运行</button>
+        </div>
+        <div class="research-runs-list" id="research-runs-list" aria-live="polite">
+          <div class="empty-state compact"><span>正在读取研究运行…</span><small>结果不会消耗数据源额度</small></div>
+        </div>
+        <div id="research-compare-result" class="research-compare-result" aria-live="polite" hidden></div>
+        <section id="research-report" class="research-report" aria-label="研究结果与风险报告" aria-live="polite" hidden></section>
+      </section>
     </main>
   </div>
 
@@ -277,6 +309,7 @@
             <li><code>GET /api/v1/watchlist</code><span>自选批量行情快照</span></li>
             <li><code>GET /api/v1/bars/{symbol}</code><span>价格、均线和成交量</span></li>
             <li><code>GET /api/v1/analysis/{symbol}</code><span>趋势、动量与风险分析</span></li>
+            <li><code>GET /api/v1/fundamentals/factors/as-of</code><span>点时点银行基本面因子（缓存只读）</span></li>
             <li><code>GET /api/v1/alerts</code><span>告警记录</span></li>
             <li><code>GET /api/v1/signals</code><span>策略信号</span></li>
             <li><code>GET /api/v1/system/status</code><span>服务健康状态</span></li>
@@ -290,6 +323,8 @@
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script src="/static/bank-research.js" defer></script>
+  <script src="/static/research-report.js" defer></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

@@ -19,6 +19,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from quant_monitor.domain import Bar, Quote, ensure_market_time, normalize_symbol, now_market_time
 from quant_monitor.market import expected_latest_daily_date
+from quant_monitor.trading_calendar import (
+    CalendarRangeError,
+    DEFAULT_TRADING_CALENDAR,
+    TradingCalendar,
+)
 
 from .indicators import IndicatorCalculator
 
@@ -122,6 +127,8 @@ class QuantitativeAnalysisService:
         volatility_window: int = 20,
         drawdown_window: int = 60,
         stale_after_seconds: Optional[float] = None,
+        *,
+        calendar: Optional[TradingCalendar] = None,
     ) -> None:
         self.sma_windows = tuple(_window(value, "sma window") for value in sma_windows)
         self.ema_windows = tuple(_window(value, "ema window") for value in ema_windows)
@@ -137,6 +144,9 @@ class QuantitativeAnalysisService:
         self.stale_after_seconds = (
             None if stale_after_seconds is None else float(stale_after_seconds)
         )
+        if calendar is not None and not isinstance(calendar, TradingCalendar):
+            raise TypeError("calendar must implement TradingCalendar")
+        self.calendar = calendar if calendar is not None else DEFAULT_TRADING_CALENDAR
 
     @property
     def required_bars(self) -> int:
@@ -430,15 +440,42 @@ class QuantitativeAnalysisService:
         freshness_timestamps = []
         if quote is not None:
             freshness_timestamps.append(quote.timestamp)
+        # Match runtime/serialization freshness semantics: a small positive
+        # skew is expected while provider and local clocks cross a polling
+        # boundary, whereas a timestamp more than five seconds ahead is an
+        # actionable replay/clock anomaly.
+        future_timestamp_tolerance_seconds = 5.0
+        future_quote = bool(
+            quote is not None
+            and (quote.timestamp - current_time).total_seconds()
+            > future_timestamp_tolerance_seconds
+        )
+        future_bar = bool(
+            latest_bar is not None
+            and (latest_bar.timestamp - current_time).total_seconds()
+            > future_timestamp_tolerance_seconds
+        )
         # A fresh quote must not hide stale research inputs.  Daily and weekly
         # series use a session-aware age allowance, while intraday bars keep
         # the caller's strict threshold.
         bar_stale = False
+        expected_daily_date = None
+        calendar_out_of_coverage = False
+        if interval == "1d":
+            try:
+                expected_daily_date = expected_latest_daily_date(
+                    current_time, calendar=self.calendar
+                )
+            except CalendarRangeError:
+                # A finite snapshot cannot certify freshness outside its
+                # coverage.  Do not quietly switch back to a weekday rule or
+                # keep an apparently positive recommendation in that case.
+                calendar_out_of_coverage = True
         if latest_bar is not None:
             if interval == "1d":
-                bar_stale = (
-                    latest_bar.timestamp.date()
-                    < expected_latest_daily_date(current_time)
+                bar_stale = bool(
+                    expected_daily_date is not None
+                    and latest_bar.timestamp.date() < expected_daily_date
                 )
             elif interval == "1w":
                 bar_age_limit = max(float(threshold or 0), 11 * 24 * 60 * 60)
@@ -458,6 +495,9 @@ class QuantitativeAnalysisService:
                 freshness_timestamps.append(latest_bar.timestamp)
         stale = bool(
             bar_stale
+            or calendar_out_of_coverage
+            or future_quote
+            or future_bar
             or (
                 threshold is not None
                 and freshness_timestamps
@@ -476,8 +516,15 @@ class QuantitativeAnalysisService:
 
         missing = [key for key, value in indicators.items() if value is None]
         quality_status = "ok" if len(ordered) >= self.required_bars else "insufficient"
-        if stale and quality_status == "ok":
+        if future_quote or future_bar:
+            quality_status = "future_timestamp"
+        elif calendar_out_of_coverage:
+            quality_status = "calendar_out_of_coverage"
+        elif stale and quality_status == "ok":
             quality_status = "stale"
+        if calendar_out_of_coverage:
+            recommendation_action = "insufficient_data"
+            recommendation_label = "交易日历覆盖不足"
         data_quality = {
             "status": quality_status,
             "bars_used": len(ordered),
@@ -490,9 +537,27 @@ class QuantitativeAnalysisService:
                 and (current_time - quote.timestamp).total_seconds()
                 > float(threshold)
             ),
+            "future_timestamp": future_quote or future_bar,
+            "future_quote": future_quote,
+            "future_bar": future_bar,
             "bar_stale": bar_stale,
             "bar_as_of": latest_bar.timestamp.isoformat() if latest_bar else None,
         }
+        if interval == "1d":
+            data_quality.update({
+                "expected_bar_date": (
+                    expected_daily_date.isoformat() if expected_daily_date else None
+                ),
+                "calendar": self.calendar.metadata.identifier,
+                "calendar_source": self.calendar.metadata.source,
+                "calendar_version": self.calendar.metadata.version,
+                "calendar_notice": self.calendar.metadata.notice,
+                "calendar_fingerprint": getattr(self.calendar, "fingerprint", None),
+                # Metadata and a reproducibility digest are not an exchange
+                # attestation, including for structural Protocol instances.
+                "calendar_verified": False,
+                "calendar_out_of_coverage": calendar_out_of_coverage,
+            })
         return AnalysisSnapshot(
             symbol=normalized_symbol,
             name=name or normalized_symbol,

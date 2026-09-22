@@ -18,10 +18,11 @@ from contextlib import contextmanager
 import hashlib
 import inspect
 import json
+import logging
 import os
 import tempfile
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -41,12 +42,18 @@ from quant_monitor.domain import (
     now_market_time,
 )
 from quant_monitor.market import expected_latest_daily_date, market_status
+from quant_monitor.trading_calendar import (
+    DEFAULT_TRADING_CALENDAR,
+    TradingCalendar,
+    VersionedSessionCalendar,
+)
 
 from .base import (
     BarFetchResult,
     BarFetchTransport,
     MarketDataProvider,
     MarketDataProviderError,
+    response_content_hash,
 )
 
 
@@ -54,6 +61,15 @@ ASHAREHUB_BASE_URL = "https://asharehub.com"
 ASHAREHUB_REALTIME_BATCH_LIMIT = 200
 ASHAREHUB_OFFICIAL_DAILY_LIMIT = 100
 ASHAREHUB_EMPTY_DAILY_RECHECK_SECONDS = 900.0
+ASHAREHUB_TRADE_CALENDAR_CACHE_SECONDS = 604800.0
+ASHAREHUB_TRADE_CALENDAR_EXCHANGES = ("SSE", "SZSE")
+# Provider timestamps can be a few seconds ahead of the local clock while a
+# response is in flight.  A larger lead is not a fresh quote: accepting it
+# would let a malformed/vendor-future row bypass the freshness gate and be
+# persisted as if it had already traded.
+ASHAREHUB_MAX_QUOTE_FUTURE_SECONDS = 300.0
+
+LOGGER = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -244,6 +260,70 @@ def _daily_time(value: Any) -> Optional[datetime]:
     return datetime(parsed.year, parsed.month, parsed.day, 15, 30, tzinfo=SHANGHAI_TZ)
 
 
+def _trade_calendar_row(
+    row: Mapping[str, Any],
+) -> Optional[Tuple[str, date, bool, Optional[date]]]:
+    """Normalize one documented AShareHub trade-calendar row.
+
+    Calendar payloads are treated as untrusted input.  Invalid rows are
+    ignored instead of allowing a malformed vendor value to classify a local
+    workday as open (or to move a daily-bar freshness watermark backwards).
+    """
+
+    exchange = str(row.get("exchange") or "").strip().upper()
+    if exchange not in ASHAREHUB_TRADE_CALENDAR_EXCHANGES:
+        return None
+    calendar_date = _compact_date(row.get("cal_date"))
+    opened = _integer(row.get("is_open"))
+    if calendar_date is None or opened not in {0, 1}:
+        return None
+    previous = _compact_date(row.get("pretrade_date"))
+    if previous is not None and previous > calendar_date:
+        return None
+    return exchange, calendar_date, bool(opened), previous
+
+
+def _trade_calendar_exchange(symbol: str) -> Optional[str]:
+    """Map a normalized A-share symbol to the exchange calendar key.
+
+    Keeping this mapping in one place avoids a subtle provenance bug where a
+    status payload says that a cached calendar was used without disclosing
+    which exchange row actually answered the lookup.  Unknown boards (for
+    example BJ) deliberately return ``None`` and therefore remain on the
+    weekday fallback.
+    """
+
+    try:
+        suffix = normalize_symbol(symbol).rsplit(".", 1)[1]
+    except (TypeError, ValueError, IndexError):
+        return None
+    return {"SH": "SSE", "SZ": "SZSE"}.get(suffix)
+
+
+def _store_trade_calendar_row(
+    target: Dict[date, Tuple[bool, Optional[date]]],
+    normalized: Tuple[str, date, bool, Optional[date]],
+) -> None:
+    """Insert one normalized row while rejecting conflicting duplicates.
+
+    A calendar is safety-critical: accepting the last duplicate row from an
+    upstream response would make the result depend on wire ordering and could
+    turn a holiday into a session (or vice versa).  Identical duplicates are
+    harmless and are deduplicated; a disagreement is treated as a malformed
+    calendar so callers fail closed to the weekday fallback.
+    """
+
+    _exchange, calendar_date, opened, previous = normalized
+    candidate = (opened, previous)
+    existing = target.get(calendar_date)
+    if existing is not None and existing != candidate:
+        raise AShareHubDataError(
+            "AShareHub trade-calendar contains conflicting duplicate rows",
+            operation="trade-calendar",
+        )
+    target[calendar_date] = candidate
+
+
 def _previous_or_same_weekday(value: date) -> date:
     """Return the latest Monday-Friday date at or before ``value``."""
 
@@ -287,6 +367,9 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         retries: int = 0,
         retry_backoff_seconds: float = 0.5,
         strict_symbols: bool = True,
+        trade_calendar_enabled: bool = False,
+        trade_calendar_cache_seconds: float = ASHAREHUB_TRADE_CALENDAR_CACHE_SECONDS,
+        trade_calendar_path: Optional[os.PathLike] = None,
         requester: Optional[Callable[..., Any]] = None,
         clock: Optional[Callable[[], datetime]] = None,
         monotonic: Optional[Callable[[], float]] = None,
@@ -304,6 +387,7 @@ class AShareHubMarketDataProvider(MarketDataProvider):
             ("bars_cache_seconds", bars_cache_seconds),
             ("instruments_cache_seconds", instruments_cache_seconds),
             ("retry_backoff_seconds", retry_backoff_seconds),
+            ("trade_calendar_cache_seconds", trade_calendar_cache_seconds),
         ):
             if float(value) < 0:
                 raise ValueError("{} cannot be negative".format(name))
@@ -343,6 +427,20 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         self.retries = int(retries)
         self.retry_backoff_seconds = float(retry_backoff_seconds)
         self.strict_symbols = bool(strict_symbols)
+        self.trade_calendar_enabled = bool(trade_calendar_enabled)
+        self.trade_calendar_cache_seconds = float(trade_calendar_cache_seconds)
+        self.trade_calendar_path = (
+            Path(trade_calendar_path)
+            if trade_calendar_path is not None
+            else self.budget_path.with_name("asharehub_trade_calendar.json")
+        )
+        try:
+            if self.trade_calendar_path.resolve() == self.budget_path.resolve():
+                raise ValueError("trade_calendar_path must differ from budget_path")
+        except OSError:
+            # Path resolution may fail on a disconnected Windows drive; the
+            # atomic writers below will report that condition at request time.
+            pass
         self._requester = requester or _sync_json_request
         self._clock = clock or now_market_time
         self._monotonic = monotonic or time.monotonic
@@ -350,12 +448,40 @@ class AShareHubMarketDataProvider(MarketDataProvider):
 
         self._request_lock: Optional[asyncio.Lock] = None
         self._quote_lock: Optional[asyncio.Lock] = None
+        self._trade_calendar_lock: Optional[asyncio.Lock] = None
         self._bar_locks: Dict[Tuple[str, Optional[str], Optional[str]], asyncio.Lock] = {}
         self._instrument_lock: Optional[asyncio.Lock] = None
         self._quotes: Dict[str, Quote] = {}
         self._quote_attempted_at: Dict[str, float] = {}
         self._last_quote_symbols: Tuple[str, ...] = ()
         self._last_quote_request_at: Optional[datetime] = None
+        # Response-shape diagnostics are intentionally kept separate from
+        # transport/error state.  A successful HTTP response can still lose
+        # rows during validation (for example a malformed price or timestamp),
+        # and operators need to distinguish that from an empty market.
+        self._last_quote_response_rows: Optional[int] = None
+        self._last_quote_parsed_symbols: Optional[int] = None
+        self._last_quote_dropped_rows: Optional[int] = None
+        # Keep response-shape counters disjoint so operators can distinguish
+        # malformed vendor rows from an otherwise valid row for an unexpected
+        # symbol (and from duplicate observations).  ``dropped_rows`` is
+        # retained for backwards compatibility as the aggregate count.
+        self._last_quote_invalid_rows: Optional[int] = None
+        self._last_quote_future_rows: Optional[int] = None
+        # Rows older than the latest in-process snapshot are not usable as a
+        # fresh quote.  Keep this diagnostic separate from malformed rows so
+        # operators can distinguish an upstream replay/out-of-order response
+        # from a schema-quality failure.
+        self._last_quote_stale_rows: Optional[int] = None
+        self._last_quote_unexpected_rows: Optional[int] = None
+        self._last_quote_duplicate_rows: Optional[int] = None
+        # A duplicate symbol is normally harmless when the provider returns
+        # an older/newer observation in the same basket.  Two *different*
+        # payloads for the exact same trade timestamp are ambiguous evidence,
+        # however, and must never be selected by wire order.
+        self._last_quote_conflict_rows: Optional[int] = None
+        self._last_quote_requested_symbols: Optional[int] = None
+        self._last_quote_missing_symbols: Tuple[str, ...] = ()
         self._off_market_quote_attempted = False
         self._bar_cache: Dict[
             Tuple[str, Optional[str], Optional[str]],
@@ -368,14 +494,33 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         self._network_bar_keys: Set[Tuple[str, datetime]] = set()
         self._instrument_cache: Optional[Tuple[float, Tuple[Instrument, ...]]] = None
         self._instrument_cache_persisted = False
+        # Calendar rows are intentionally kept separate from the generic
+        # ``market.py`` fallback.  A valid cache can suppress holiday polling;
+        # an expired/invalid cache never silently promotes a weekday guess.
+        self._trade_calendar: Dict[str, Dict[date, Tuple[bool, Optional[date]]]] = {
+            exchange: {} for exchange in ASHAREHUB_TRADE_CALENDAR_EXCHANGES
+        }
+        self._trade_calendar_loaded_at: Optional[float] = None
+        self._trade_calendar_last_refresh_at: Optional[datetime] = None
+        self._trade_calendar_error_type: Optional[str] = None
+        self._trade_calendar_source = "weekday_fallback"
         self._last_http_status: Optional[int] = None
         self._last_error_type: Optional[str] = None
         self._last_success_at: Optional[datetime] = None
         self._last_quote_success_at: Optional[datetime] = None
         self._last_bar_success_at: Optional[datetime] = None
+        # A daily row is stamped at the conservative after-close availability
+        # time (15:30).  Keep rows whose stamped time is ahead of our clock
+        # out of the cache and expose the count for operator diagnostics.
+        self._last_bar_future_rows: Optional[int] = None
         self._last_catalogue_success_at: Optional[datetime] = None
         self._fatal_error: Optional[AShareHubError] = None
         self._fatal_error_date: Optional[str] = None
+        # Endpoint permissions are not necessarily uniform across an
+        # AShareHub plan.  Keep the operation that opened a permission
+        # circuit so an unavailable realtime endpoint does not also suppress
+        # daily history/catalogue calls that the key is allowed to use.
+        self._fatal_error_operation: Optional[str] = None
         self._request_in_progress = False
         self._closed = False
 
@@ -383,6 +528,7 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         self._budget_used = 0
         self._last_request_at: Optional[datetime] = None
         self._load_initial_budget()
+        self._load_trade_calendar_cache()
 
     @property
     def name(self) -> str:
@@ -423,6 +569,64 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         )
         return normalized
 
+    def get_trading_calendar(
+        self, symbols: Optional[Sequence[str]] = None
+    ) -> TradingCalendar:
+        """Return the currently loaded exchange calendar for ``symbols``.
+
+        AShareHub's calendar endpoint is cached as two exchange-specific row
+        maps because market status needs to answer a symbol-level question.
+        Research and quality services consume the common ``TradingCalendar``
+        contract instead, so expose a finite, immutable view only when every
+        requested exchange has usable rows.  A mixed SSE/SZSE view uses the
+        intersection of open sessions: if the exchanges ever disagree, a
+        session is excluded rather than silently treating a holiday as a
+        valid execution date.  Missing/expired/partial coverage deliberately
+        falls back to the project's explicit weekday calendar.
+
+        This method is cache-only.  It never refreshes the provider and never
+        spends a request; callers can safely use it from REST quality and
+        backtest paths.
+        """
+
+        if not self.trade_calendar_enabled or not self._calendar_valid():
+            return DEFAULT_TRADING_CALENDAR
+        requested = tuple(symbols or self._configured_symbols)
+        exchanges = []
+        for symbol in requested:
+            exchange = _trade_calendar_exchange(symbol)
+            if exchange is not None and exchange not in exchanges:
+                exchanges.append(exchange)
+        if not exchanges:
+            return DEFAULT_TRADING_CALENDAR
+        opened_sets = []
+        for exchange in exchanges:
+            rows = self._trade_calendar.get(exchange, {})
+            if not rows:
+                return DEFAULT_TRADING_CALENDAR
+            opened_sets.append(
+                {day for day, (opened, _previous) in rows.items() if opened}
+            )
+        sessions = tuple(sorted(set.intersection(*opened_sets)))
+        if not sessions:
+            return DEFAULT_TRADING_CALENDAR
+        try:
+            return VersionedSessionCalendar(
+                sessions,
+                identifier="asharehub_trade_calendar",
+                source=self._trade_calendar_source,
+                version="asharehub-trade-calendar-v1",
+                notice=(
+                    "AShareHub exchange trade-calendar cache; rows are finite, "
+                    "unverified vendor evidence and do not attest official provenance."
+                ),
+            )
+        except (TypeError, ValueError):
+            # A malformed in-memory cache must not become a research session
+            # schedule.  Keep the provider's explicit status/error payload as
+            # the operator-facing diagnosis and fail closed here.
+            return DEFAULT_TRADING_CALENDAR
+
     @property
     def supported_intervals(self) -> Tuple[str, ...]:
         return ("1d",)
@@ -432,10 +636,106 @@ class AShareHubMarketDataProvider(MarketDataProvider):
 
     def _market_open(self) -> bool:
         try:
-            return bool(self._market_status_fetcher(self._market_now()).get("is_trading"))
+            # The provider-aware status applies the exchange calendar before
+            # evaluating session hours.  This matters for make-up Saturdays:
+            # the weekday fallback says ``closed`` there, while SSE/SZSE may
+            # explicitly mark the date open.
+            return bool(self.current_market_status().get("is_trading"))
         except Exception:
             # Failing closed protects a scarce quota from a tight polling loop.
             return False
+
+    def current_market_status(self) -> Mapping[str, Any]:
+        """Return session status with the cached exchange calendar applied.
+
+        The application-level fallback calendar remains untouched for other
+        providers.  Runtime callers can opt into this method for AShareHub so
+        a known holiday is not reported as an active session merely because it
+        falls on a weekday.  No network request is made here.
+        """
+
+        now = self._market_now()
+        try:
+            status = dict(self._market_status_fetcher(now))
+        except Exception:
+            status = {"is_trading": False, "is_trading_day": False}
+        lookup = None
+        lookup_exchange = None
+        for symbol in self._configured_symbols:
+            exchange = _trade_calendar_exchange(symbol)
+            if exchange is None:
+                continue
+            lookup = self._calendar_lookup(symbol, now)
+            if lookup is not None:
+                lookup_exchange = exchange
+                break
+        if lookup is not None and not lookup[0]:
+            status["is_trading"] = False
+            status["is_trading_day"] = False
+            status["phase"] = "closed"
+            status["label"] = "节假日休市"
+            status["calendar"] = self._trade_calendar_source
+            status["calendar_notice"] = "AShareHub exchange trade calendar"
+            status["calendar_exchange"] = lookup_exchange
+            status["calendar_lookup"] = "closed"
+        elif lookup is not None:
+            # Override only the trading-day decision; retain the canonical
+            # session labels/times from ``market_status`` where available.
+            # On a make-up weekend day the weekday fallback has no phase, so
+            # derive the regular continuous-session phase explicitly.
+            status["is_trading_day"] = True
+            value = now.time().replace(tzinfo=None)
+            if datetime_time(9, 15) <= value < datetime_time(9, 25):
+                status["phase"], status["label"] = "opening_auction", "开盘集合竞价"
+            elif datetime_time(9, 25) <= value < datetime_time(9, 30):
+                status["phase"], status["label"] = "pre_open", "开盘等待"
+            elif datetime_time(9, 30) <= value < datetime_time(11, 30):
+                status["phase"], status["label"] = "morning", "上午连续竞价"
+                status["is_trading"] = True
+            elif datetime_time(11, 30) <= value < datetime_time(13, 0):
+                status["phase"], status["label"] = "lunch_break", "午间休市"
+            elif datetime_time(13, 0) <= value < datetime_time(14, 57):
+                status["phase"], status["label"] = "afternoon", "下午连续竞价"
+                status["is_trading"] = True
+            elif datetime_time(14, 57) <= value < datetime_time(15, 0):
+                status["phase"], status["label"] = "closing_auction", "收盘集合竞价"
+                status["is_trading"] = True
+            status["calendar"] = self._trade_calendar_source
+            status["calendar_notice"] = "AShareHub exchange trade calendar"
+            status["calendar_exchange"] = lookup_exchange
+            status["calendar_lookup"] = "open"
+        elif self.trade_calendar_enabled and self._trade_calendar_loaded_at is not None:
+            # A loaded calendar with no row for today's date is bounded or
+            # incomplete.  It must not be presented as an exchange-confirmed
+            # weekday/holiday decision; disclose that the status is falling
+            # back because the date is outside cached coverage.
+            status["calendar"] = "weekday_fallback"
+            status["calendar_source"] = "built_in_weekday_rule"
+            status["calendar_version"] = "1"
+            status["calendar_fingerprint"] = None
+            status["calendar_verified"] = False
+            status["calendar_lookup"] = "unknown"
+            status["calendar_notice"] = (
+                "AShareHub calendar has no row for the current date; "
+                "weekday fallback is used"
+            )
+        if lookup is not None:
+            # Replace the fallback calendar lineage as a unit.  Previously we
+            # changed only ``calendar``/``calendar_notice`` above, leaving
+            # ``calendar_source`` and ``calendar_version`` pointing at the
+            # built-in weekday rule.  That contradictory payload could make a
+            # known exchange holiday look like a weekday-fallback decision to
+            # downstream audits.  The cache schema version is explicit, while
+            # ``calendar_verified`` remains false until authenticated evidence
+            # is available.
+            status["calendar_source"] = self._trade_calendar_source
+            status["calendar_version"] = "asharehub-trade-calendar-v1"
+            calendar_view = self.get_trading_calendar(self._configured_symbols)
+            status["calendar_fingerprint"] = getattr(
+                calendar_view, "fingerprint", None
+            )
+            status["calendar_verified"] = False
+        return status
 
     def _today_budget(self) -> Tuple[str, int]:
         today = self._market_now().date().isoformat()
@@ -497,6 +797,9 @@ class AShareHubMarketDataProvider(MarketDataProvider):
             "local_budget_exhausted": local_budget_exhausted,
             "upstream_quota_exhausted": upstream_quota_exhausted,
             "permission_circuit_open": permission_circuit_open,
+            "permission_circuit_operation": (
+                self._fatal_error_operation if permission_circuit_open else None
+            ),
             "budget_date": budget_date,
             "last_request_at": (
                 self._last_request_at.isoformat() if self._last_request_at else None
@@ -509,11 +812,23 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                 if self._last_quote_success_at
                 else None
             ),
+            "last_quote_response_rows": self._last_quote_response_rows,
+            "last_quote_parsed_symbols": self._last_quote_parsed_symbols,
+            "last_quote_dropped_rows": self._last_quote_dropped_rows,
+            "last_quote_invalid_rows": self._last_quote_invalid_rows,
+            "last_quote_future_rows": self._last_quote_future_rows,
+            "last_quote_stale_rows": self._last_quote_stale_rows,
+            "last_quote_unexpected_rows": self._last_quote_unexpected_rows,
+            "last_quote_duplicate_rows": self._last_quote_duplicate_rows,
+            "last_quote_conflict_rows": self._last_quote_conflict_rows,
+            "last_quote_requested_symbols": self._last_quote_requested_symbols,
+            "last_quote_missing_symbols": list(self._last_quote_missing_symbols),
             "last_bar_success_at": (
                 self._last_bar_success_at.isoformat()
                 if self._last_bar_success_at
                 else None
             ),
+            "last_bar_future_rows": self._last_bar_future_rows,
             "last_catalogue_success_at": (
                 self._last_catalogue_success_at.isoformat()
                 if self._last_catalogue_success_at
@@ -523,7 +838,237 @@ class AShareHubMarketDataProvider(MarketDataProvider):
             "quote_cache_seconds": self.quote_cache_seconds,
             "market_open": market_open,
             "order_book_enabled": False,
+            "trade_calendar_enabled": self.trade_calendar_enabled,
+            "trade_calendar_source": self._trade_calendar_source,
+            "trade_calendar_last_refresh_at": (
+                self._trade_calendar_last_refresh_at.isoformat()
+                if self._trade_calendar_last_refresh_at
+                else None
+            ),
+            "trade_calendar_error_type": self._trade_calendar_error_type,
+            "trade_calendar_cache_seconds": self.trade_calendar_cache_seconds,
+            "trade_calendar_fingerprint": getattr(
+                self.get_trading_calendar(self._configured_symbols),
+                "fingerprint",
+                None,
+            ),
         }
+
+    def _load_trade_calendar_cache(self) -> None:
+        """Load a safe, non-secret calendar snapshot written by this adapter."""
+
+        if not self.trade_calendar_enabled or not self.trade_calendar_path.exists():
+            return
+        try:
+            payload = json.loads(self.trade_calendar_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping) or int(payload.get("version", 0)) != 1:
+                raise ValueError
+            saved_at = _quote_time(payload.get("saved_at"))
+            if saved_at is None:
+                raise ValueError
+            age = (self._market_now() - saved_at).total_seconds()
+            if age < 0:
+                # A clock-skewed snapshot must not classify a session as a
+                # verified holiday.  Keep the explicit reason visible so an
+                # operator can correct the host clock/cache rather than
+                # mistaking the weekday fallback for exchange truth.
+                self._trade_calendar_error_type = "TradeCalendarCacheFuture"
+                return
+            if age >= self.trade_calendar_cache_seconds:
+                self._trade_calendar_error_type = "TradeCalendarCacheExpired"
+                return
+            rows = payload.get("rows")
+            if not isinstance(rows, list):
+                raise ValueError
+            parsed: Dict[str, Dict[date, Tuple[bool, Optional[date]]]] = {
+                exchange: {} for exchange in ASHAREHUB_TRADE_CALENDAR_EXCHANGES
+            }
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                normalized = _trade_calendar_row(row)
+                if normalized is None:
+                    continue
+                exchange, calendar_date, opened, previous = normalized
+                _store_trade_calendar_row(parsed[exchange], normalized)
+            if not any(parsed.values()):
+                raise ValueError
+            self._trade_calendar = parsed
+            self._trade_calendar_loaded_at = self._monotonic()
+            self._trade_calendar_last_refresh_at = saved_at
+            self._trade_calendar_source = (
+                "asharehub_cache" if all(parsed.values()) else "asharehub_cache_partial"
+            )
+            if not all(parsed.values()):
+                self._trade_calendar_error_type = "TradeCalendarPartialData"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, AShareHubError):
+            # A corrupt cache is disposable.  Keep the provider usable with
+            # the explicit weekday fallback and refresh it on the next call.
+            self._trade_calendar_error_type = "TradeCalendarCacheError"
+
+    def _persist_trade_calendar_cache(self) -> None:
+        rows: List[Dict[str, Any]] = []
+        for exchange in ASHAREHUB_TRADE_CALENDAR_EXCHANGES:
+            for calendar_date, (opened, previous) in sorted(
+                self._trade_calendar.get(exchange, {}).items()
+            ):
+                rows.append(
+                    {
+                        "exchange": exchange,
+                        "cal_date": calendar_date.strftime("%Y%m%d"),
+                        "is_open": 1 if opened else 0,
+                        "pretrade_date": (
+                            previous.strftime("%Y%m%d") if previous else None
+                        ),
+                    }
+                )
+        payload = {
+            "version": 1,
+            "saved_at": self._trade_calendar_last_refresh_at.isoformat()
+            if self._trade_calendar_last_refresh_at
+            else self._market_now().isoformat(),
+            "rows": rows,
+        }
+        temporary: Optional[Path] = None
+        try:
+            self.trade_calendar_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(self.trade_calendar_path.parent),
+                prefix=".asharehub-calendar-",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temporary), str(self.trade_calendar_path))
+        except OSError:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+            # Calendar persistence is an optimization.  Do not discard a
+            # successful upstream response because a read-only disk prevented
+            # writing the cache; expose the condition through logs/status.
+            LOGGER.warning("AShareHub trade-calendar cache could not be persisted")
+
+    def _calendar_valid(self) -> bool:
+        if not self.trade_calendar_enabled or self._trade_calendar_loaded_at is None:
+            return False
+        return (
+            self._monotonic() - self._trade_calendar_loaded_at
+            < self.trade_calendar_cache_seconds
+        )
+
+    def _calendar_lookup(
+        self, symbol: str, at: datetime
+    ) -> Optional[Tuple[bool, Optional[date]]]:
+        if not self._calendar_valid():
+            return None
+        exchange = _trade_calendar_exchange(symbol)
+        if exchange is None:
+            return None
+        rows = self._trade_calendar.get(exchange, {})
+        current_date = ensure_market_time(at).date()
+        direct = rows.get(current_date)
+        if direct is not None:
+            opened, previous = direct
+            if previous is None and not opened:
+                previous = max(
+                    (day for day, (is_open, _) in rows.items() if is_open and day < current_date),
+                    default=None,
+                )
+            return opened, previous
+        # Some responses may be bounded by vendor retention.  A missing date
+        # is unknown, not a holiday; callers must retain weekday fallback.
+        return None
+
+    def _calendar_expected_latest_date(self, symbol: str, at: datetime) -> date:
+        current = ensure_market_time(at)
+        fallback = _expected_latest_daily_date(current)
+        lookup = self._calendar_lookup(symbol, current)
+        if lookup is None:
+            return fallback
+        opened, previous = lookup
+        if opened and current.time().replace(tzinfo=None) >= datetime_time(15, 30):
+            return current.date()
+        if previous is not None:
+            return previous
+        return fallback
+
+    async def _ensure_trade_calendar(self, *, reserve_requests: int = 0) -> None:
+        """Refresh exchange calendars once per cache window, fail-open to fallback."""
+
+        if not self.trade_calendar_enabled or self._calendar_valid():
+            return
+        if isinstance(reserve_requests, bool) or not isinstance(reserve_requests, int):
+            raise TypeError("reserve_requests must be an integer")
+        if reserve_requests < 0 or reserve_requests >= self.daily_soft_limit:
+            raise ValueError("reserve_requests must be non-negative and below the soft limit")
+        async with self._trade_calendar_guard():
+            if self._calendar_valid():
+                return
+            # Keep at least one request for a user-visible quote/history call.
+            try:
+                self._refresh_budget_from_disk()
+                if (
+                    self._budget_used
+                    + len(ASHAREHUB_TRADE_CALENDAR_EXCHANGES)
+                    + reserve_requests
+                    >= self.daily_soft_limit
+                ):
+                    self._trade_calendar_error_type = "TradeCalendarBudgetReserved"
+                    self._trade_calendar_source = "weekday_fallback_budget_reserved"
+                    return
+            except AShareHubError:
+                self._trade_calendar_error_type = "TradeCalendarBudgetCheckError"
+                self._trade_calendar_source = "weekday_fallback"
+                return
+            parsed: Dict[str, Dict[date, Tuple[bool, Optional[date]]]] = {
+                exchange: {} for exchange in ASHAREHUB_TRADE_CALENDAR_EXCHANGES
+            }
+            try:
+                for exchange in ASHAREHUB_TRADE_CALENDAR_EXCHANGES:
+                    rows = await self._request_json(
+                        "/v2/reference/trade-calendar",
+                        operation="trade-calendar",
+                        params={"exchange": exchange},
+                        set_fatal=False,
+                    )
+                    for row in rows:
+                        normalized = _trade_calendar_row(row)
+                        if normalized is None:
+                            continue
+                        row_exchange, calendar_date, opened, previous = normalized
+                        if row_exchange == exchange:
+                            _store_trade_calendar_row(parsed[exchange], normalized)
+                if not any(parsed.values()):
+                    raise AShareHubDataError(
+                        "AShareHub trade-calendar response contains no usable rows",
+                        operation="trade-calendar",
+                    )
+            except AShareHubError as exc:
+                self._trade_calendar_error_type = type(exc).__name__
+                self._trade_calendar_source = "weekday_fallback"
+                LOGGER.warning("AShareHub trade-calendar unavailable: %s", type(exc).__name__)
+                return
+            self._trade_calendar = parsed
+            self._trade_calendar_loaded_at = self._monotonic()
+            self._trade_calendar_last_refresh_at = self._market_now()
+            if all(parsed.values()):
+                self._trade_calendar_error_type = None
+                self._trade_calendar_source = "asharehub"
+            else:
+                # Keep usable exchange rows, but make the incomplete coverage
+                # visible so the missing exchange continues using the explicit
+                # weekday fallback rather than being mistaken for verified data.
+                self._trade_calendar_error_type = "TradeCalendarPartialData"
+                self._trade_calendar_source = "asharehub_partial"
+            self._persist_trade_calendar_cache()
 
     def _load_initial_budget(self) -> None:
         if not self.budget_path.exists():
@@ -636,6 +1181,33 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                 "AShareHub local budget lock is unavailable; request was not sent"
             ) from None
 
+    async def _consume_budget_async(self, *, reserve_requests: int = 0) -> None:
+        """Reserve one request without blocking the asyncio event loop.
+
+        The daily budget is intentionally persisted under a cross-process file
+        lock.  On Windows another process (for example a second dashboard
+        instance or a backup tool) can hold that lock for an unbounded amount
+        of time.  Calling the synchronous implementation directly from an
+        async provider request used to freeze health checks and WebSocket
+        heartbeats while the lock was contended.  Keep the file/JSON logic
+        synchronous, but run it on a worker and drain that worker on
+        cancellation so a committed reservation cannot race repository or
+        provider shutdown.
+        """
+
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._consume_budget,
+                reserve_requests=reserve_requests,
+            ),
+            name="asharehub-budget-reservation",
+        )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
     def _request_guard(self) -> asyncio.Lock:
         if self._request_lock is None:
             self._request_lock = asyncio.Lock()
@@ -650,6 +1222,11 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         if self._instrument_lock is None:
             self._instrument_lock = asyncio.Lock()
         return self._instrument_lock
+
+    def _trade_calendar_guard(self) -> asyncio.Lock:
+        if self._trade_calendar_lock is None:
+            self._trade_calendar_lock = asyncio.Lock()
+        return self._trade_calendar_lock
 
     @staticmethod
     def _map_status(status: int, operation: str) -> AShareHubError:
@@ -726,12 +1303,14 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         operation: str,
         params: Optional[Mapping[str, str]] = None,
         reserve_requests: int = 0,
+        set_fatal: bool = True,
     ) -> List[Mapping[str, Any]]:
-        rows, _ = await self._request_json_with_receipt(
+        rows, _, _ = await self._request_json_with_receipt(
             path,
             operation=operation,
             params=params,
             reserve_requests=reserve_requests,
+            set_fatal=set_fatal,
         )
         return rows
 
@@ -742,8 +1321,9 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         operation: str,
         params: Optional[Mapping[str, str]] = None,
         reserve_requests: int = 0,
-    ) -> Tuple[List[Mapping[str, Any]], datetime]:
-        """Return decoded rows and the receipt instant from the same request.
+        set_fatal: bool = True,
+    ) -> Tuple[List[Mapping[str, Any]], datetime, str]:
+        """Return decoded rows, receipt instant, and parsed-response digest.
 
         The timestamp is returned alongside the response instead of recovered
         from ``_last_*_success_at`` so overlapping per-symbol parsing cannot
@@ -753,6 +1333,18 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         if self._closed:
             raise AShareHubConfigurationError("AShareHub provider is closed")
         if self._fatal_error is not None:
+            # Authentication, quota and local-budget failures are account or
+            # process wide.  A 403 permission response is the exception:
+            # vendors may grant history while denying realtime (or vice
+            # versa), so only short-circuit the same endpoint operation.
+            permission_for_other_operation = (
+                isinstance(self._fatal_error, AShareHubPermissionError)
+                and self._fatal_error_operation is not None
+                and self._fatal_error_operation != operation
+            )
+        else:
+            permission_for_other_operation = False
+        if self._fatal_error is not None and not permission_for_other_operation:
             today = self._market_now().date().isoformat()
             if isinstance(
                 self._fatal_error,
@@ -765,11 +1357,13 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                 self._today_budget()
                 self._fatal_error = None
                 self._fatal_error_date = None
+                self._fatal_error_operation = None
             elif isinstance(self._fatal_error, AShareHubBudgetError):
                 self._today_budget()
                 if self._budget_used < self.daily_soft_limit:
                     self._fatal_error = None
                     self._fatal_error_date = None
+                    self._fatal_error_operation = None
                 else:
                     raise self._fatal_error
             else:
@@ -784,7 +1378,9 @@ class AShareHubMarketDataProvider(MarketDataProvider):
             for attempt in range(self.retries + 1):
                 self._request_in_progress = True
                 try:
-                    self._consume_budget(reserve_requests=reserve_requests)
+                    await self._consume_budget_async(
+                        reserve_requests=reserve_requests
+                    )
                     decoded = await self._invoke_requester(
                         "GET", url, headers, dict(params or {})
                     )
@@ -812,11 +1408,16 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                     elif operation == "reference-stocks":
                         self._last_catalogue_success_at = self._last_success_at
                     self._last_error_type = None
-                    return [dict(row) for row in decoded], response_received_at
+                    parsed_rows = [dict(row) for row in decoded]
+                    return (
+                        parsed_rows,
+                        response_received_at,
+                        response_content_hash(parsed_rows),
+                    )
                 except _HTTPStatusError as exc:
                     self._last_http_status = exc.status
                     last_error = self._map_status(exc.status, operation)
-                    if isinstance(
+                    if set_fatal and isinstance(
                         last_error,
                         (
                             AShareHubAuthenticationError,
@@ -826,11 +1427,12 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                     ):
                         self._fatal_error = last_error
                         self._fatal_error_date = self._market_now().date().isoformat()
+                        self._fatal_error_operation = operation
                 except AShareHubError as exc:
                     last_error = exc
                     if exc.status_code is not None:
                         self._last_http_status = exc.status_code
-                    if isinstance(
+                    if set_fatal and isinstance(
                         exc,
                         (
                             AShareHubAuthenticationError,
@@ -841,6 +1443,7 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                     ):
                         self._fatal_error = exc
                         self._fatal_error_date = self._market_now().date().isoformat()
+                        self._fatal_error_operation = operation
                 finally:
                     self._request_in_progress = False
 
@@ -922,9 +1525,23 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                 "AShareHub realtime basket supports at most 200 symbols per request"
             )
 
+        await self._ensure_trade_calendar()
+
         market_open = self._market_open()
         if market_open:
             self._off_market_quote_attempted = False
+        # A verified-in-cache holiday is different from an ordinary closed
+        # session: no quote exists for this date, so an upstream snapshot call
+        # would only waste quota.  Return any persisted prior close (marked
+        # stale by the API layer) or preserve strict missing-data semantics.
+        if not market_open and any(
+            (lookup := self._calendar_lookup(symbol, self._market_now())) is not None
+            and not lookup[0]
+            for symbol in requested
+        ):
+            self._off_market_quote_attempted = True
+            cached = [self._quotes[item] for item in requested if item in self._quotes]
+            return self._finish_quotes(requested, cached, strict=strict)
         cached = self._cached_quotes(requested, allow_stale=not market_open)
         if cached is not None:
             return self._finish_quotes(requested, cached, strict=strict)
@@ -936,6 +1553,14 @@ class AShareHubMarketDataProvider(MarketDataProvider):
             market_open = self._market_open()
             if market_open:
                 self._off_market_quote_attempted = False
+            if not market_open and any(
+                (lookup := self._calendar_lookup(symbol, self._market_now())) is not None
+                and not lookup[0]
+                for symbol in requested
+            ):
+                self._off_market_quote_attempted = True
+                cached = [self._quotes[item] for item in requested if item in self._quotes]
+                return self._finish_quotes(requested, cached, strict=strict)
             cached = self._cached_quotes(requested, allow_stale=not market_open)
             if cached is not None:
                 return self._finish_quotes(requested, cached, strict=strict)
@@ -954,18 +1579,91 @@ class AShareHubMarketDataProvider(MarketDataProvider):
             )
             attempted_at = self._monotonic()
             parsed: Dict[str, Quote] = {}
+            invalid_rows = 0
+            future_rows = 0
+            stale_rows = 0
+            stale_symbols: Set[str] = set()
+            unexpected_rows = 0
+            duplicate_rows = 0
+            conflict_rows = 0
             for row in rows:
+                try:
+                    row_symbol = normalize_symbol(str(row.get("symbol") or ""))
+                except (AttributeError, ValueError):
+                    invalid_rows += 1
+                    continue
+                if row_symbol not in requested:
+                    unexpected_rows += 1
+                    continue
                 quote = self._quote_from_row(row, requested)
                 if quote is None:
+                    invalid_rows += 1
+                    continue
+                # Keep the same five-minute clock-skew tolerance used when
+                # hydrating persisted quotes, but never accept a row that is
+                # materially in the future.  Such rows must not enter the
+                # in-memory cache or downstream SQLite/event pipeline.
+                if quote.timestamp > self._market_now() + timedelta(
+                    seconds=ASHAREHUB_MAX_QUOTE_FUTURE_SECONDS
+                ):
+                    future_rows += 1
+                    continue
+                cached_quote = self._quotes.get(quote.symbol)
+                if cached_quote is not None and quote.timestamp < cached_quote.timestamp:
+                    # Do not let an out-of-order provider response overwrite
+                    # the last known good snapshot.  The row is omitted from
+                    # this response; strict callers fail closed via
+                    # ``_finish_quotes`` while relaxed callers can still use
+                    # the other symbols in the basket.  Crucially, the cache
+                    # attempt watermark is also left untouched so a stale
+                    # response cannot suppress a retry for ``quote_cache``.
+                    stale_rows += 1
+                    stale_symbols.add(quote.symbol)
                     continue
                 current = parsed.get(quote.symbol)
+                if current is not None:
+                    duplicate_rows += 1
+                    if current.timestamp == quote.timestamp and current != quote:
+                        # A same-timestamp revision has no sequence/version
+                        # in the AShareHub realtime contract.  Choosing either
+                        # row would make the result depend on response order,
+                        # so fail closed and leave the previous cache intact.
+                        conflict_rows += 1
+                        self._last_quote_conflict_rows = conflict_rows
+                        self._last_error_type = "AShareHubDataError"
+                        raise AShareHubDataError(
+                            "AShareHub realtime response contains conflicting "
+                            "duplicate rows for {} at {}".format(
+                                quote.symbol,
+                                quote.timestamp.isoformat(),
+                            ),
+                            operation="realtime",
+                        )
                 if current is None or quote.timestamp >= current.timestamp:
                     parsed[quote.symbol] = quote
+            missing_symbols = tuple(symbol for symbol in requested if symbol not in parsed)
+            self._last_quote_response_rows = len(rows)
+            self._last_quote_parsed_symbols = len(parsed)
+            self._last_quote_dropped_rows = max(0, len(rows) - len(parsed))
+            self._last_quote_invalid_rows = invalid_rows
+            self._last_quote_future_rows = future_rows
+            self._last_quote_stale_rows = stale_rows
+            self._last_quote_unexpected_rows = unexpected_rows
+            self._last_quote_duplicate_rows = duplicate_rows
+            self._last_quote_conflict_rows = conflict_rows
+            self._last_quote_requested_symbols = len(requested)
+            self._last_quote_missing_symbols = missing_symbols
             for symbol in requested:
-                self._quote_attempted_at[symbol] = attempted_at
                 if symbol in parsed:
+                    self._quote_attempted_at[symbol] = attempted_at
                     self._quotes[symbol] = parsed[symbol]
+                elif symbol in stale_symbols:
+                    # Keep both the last known good quote and its original
+                    # freshness watermark. A stale upstream replay must not
+                    # erase a usable snapshot or make it look newly fetched.
+                    continue
                 else:
+                    self._quote_attempted_at[symbol] = attempted_at
                     self._quotes.pop(symbol, None)
             self._last_quote_request_at = self._market_now()
             self._last_quote_symbols = tuple(
@@ -1123,9 +1821,8 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         effective_start = effective_end - timedelta(days=max(365, int(limit) * 3))
         start_date = effective_start.strftime("%Y%m%d")
         end_date = effective_end.strftime("%Y%m%d")
-        required_latest_date = min(
-            _previous_or_same_weekday(effective_end.date()),
-            _expected_latest_daily_date(effective_end),
+        required_latest_date = self._calendar_expected_latest_date(
+            normalized_symbol, effective_end
         )
         if self._seeded_result(
             normalized_symbol,
@@ -1163,9 +1860,8 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         effective_start = effective_end - timedelta(
             days=max(365, int(minimum_rows) * 3)
         )
-        required_latest_date = min(
-            _previous_or_same_weekday(effective_end.date()),
-            _expected_latest_daily_date(effective_end),
+        required_latest_date = self._calendar_expected_latest_date(
+            normalized_symbol, effective_end
         )
         return self._seeded_result(
             normalized_symbol,
@@ -1204,6 +1900,7 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         reserve_requests: int = 0,
     ) -> BarFetchResult:
         normalized_symbol = normalize_symbol(symbol)
+        await self._ensure_trade_calendar(reserve_requests=reserve_requests)
         selected_interval = str(interval).strip().lower()
         if selected_interval != "1d":
             raise ValueError("AShareHub only provides 1d A-share bars")
@@ -1232,12 +1929,13 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         # merely having ``limit`` old rows is not proof of freshness.
         now = self._market_now()
         if end_time is None or effective_end.date() >= now.date():
-            required_latest_date = min(
-                _previous_or_same_weekday(effective_end.date()),
-                _expected_latest_daily_date(now),
+            required_latest_date = self._calendar_expected_latest_date(
+                normalized_symbol, now
             )
         else:
-            required_latest_date = _previous_or_same_weekday(effective_end.date())
+            required_latest_date = self._calendar_expected_latest_date(
+                normalized_symbol, effective_end
+            )
 
         seeded = self._seeded_result(
             normalized_symbol,
@@ -1304,7 +2002,7 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                     start_date, latest_seed_date.strftime("%Y%m%d")
                 )
 
-            rows, response_received_at = await self._request_json_with_receipt(
+            rows, response_received_at, response_hash = await self._request_json_with_receipt(
                 "/v2/market/daily",
                 operation="market-daily",
                 params={
@@ -1316,15 +2014,47 @@ class AShareHubMarketDataProvider(MarketDataProvider):
             )
             parsed: Dict[datetime, Bar] = {}
             parsed_observations: List[Bar] = []
+            future_rows = 0
+            response_now = self._market_now()
             for row in rows:
                 bar = self._bar_from_row(row, normalized_symbol)
                 if bar is None:
                     continue
+                # ``_daily_time`` intentionally stamps a session at 15:30,
+                # the earliest conservative availability time.  A vendor
+                # response may nevertheless include today's partial row
+                # before close (or a clock-skewed future row).  Accepting it
+                # would make current-history readiness true before the bar is
+                # actually available and could leak future information into a
+                # backtest.  Treat it as unusable evidence and fail closed if
+                # the entire response consists of such rows.
+                if bar.timestamp > response_now:
+                    future_rows += 1
+                    continue
                 compact_timestamp = bar.timestamp.strftime("%Y%m%d")
                 if not start_date <= compact_timestamp <= end_date:
                     continue
+                # A repeated identical row can occur at an upstream page
+                # boundary and is safe to deduplicate.  A conflicting second
+                # row for the same session is ambiguous evidence, however;
+                # never let dictionary insertion order silently choose which
+                # OHLCV value gets persisted.
+                existing = parsed.get(bar.timestamp)
+                if existing is not None:
+                    if existing != bar:
+                        self._last_error_type = "AShareHubDataError"
+                        raise AShareHubDataError(
+                            "AShareHub daily response contains conflicting duplicate "
+                            "rows for {} at {}".format(
+                                normalized_symbol,
+                                bar.timestamp.date().isoformat(),
+                            ),
+                            operation="market-daily",
+                        )
+                    continue
                 parsed_observations.append(bar)
                 parsed[bar.timestamp] = bar
+            self._last_bar_future_rows = future_rows
             if rows and not parsed:
                 self._last_error_type = "AShareHubDataError"
                 raise AShareHubDataError(
@@ -1359,6 +2089,7 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                 ),
                 transport=BarFetchTransport.NETWORK,
                 response_received_at=response_received_at,
+                response_content_hash=response_hash,
             )
 
     def _bar_cache_ttl(
@@ -1489,6 +2220,8 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         self._bar_cache.clear()
         self._seeded_bars.clear()
         self._network_bar_keys.clear()
+        self._trade_calendar.clear()
+        self._trade_calendar_loaded_at = None
         self._instrument_cache = None
         self._api_key = ""
 
@@ -1496,6 +2229,8 @@ class AShareHubMarketDataProvider(MarketDataProvider):
 __all__ = [
     "ASHAREHUB_BASE_URL",
     "ASHAREHUB_REALTIME_BATCH_LIMIT",
+    "ASHAREHUB_TRADE_CALENDAR_CACHE_SECONDS",
+    "ASHAREHUB_TRADE_CALENDAR_EXCHANGES",
     "AShareHubError",
     "AShareHubConfigurationError",
     "AShareHubAuthenticationError",

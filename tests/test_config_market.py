@@ -71,6 +71,32 @@ def test_short_environment_aliases(tmp_path):
     assert settings.poll_interval_seconds == 7.5
 
 
+def test_startup_database_timeout_is_configurable_and_positive():
+    settings = load_settings(
+        environ={"QUANT_MONITOR_STARTUP_DATABASE_TIMEOUT_SECONDS": "4.5"}
+    )
+
+    assert settings.startup_database_timeout_seconds == pytest.approx(4.5)
+    assert settings.public_dict()["startup_database_timeout_seconds"] == pytest.approx(4.5)
+    with pytest.raises(ValueError, match="startup_database_timeout_seconds"):
+        Settings(startup_database_timeout_seconds=0)
+    with pytest.raises(ValueError, match="startup_database_timeout_seconds"):
+        Settings(startup_database_timeout_seconds=float("nan"))
+
+
+def test_api_request_body_limit_is_configurable_and_bounded():
+    settings = load_settings(
+        environ={"QUANT_MONITOR_API_MAX_REQUEST_BODY_BYTES": "131072"}
+    )
+
+    assert settings.api_max_request_body_bytes == 131072
+    assert settings.public_dict()["api_max_request_body_bytes"] == 131072
+    with pytest.raises(ValueError, match="api_max_request_body_bytes"):
+        Settings(api_max_request_body_bytes=65535)
+    with pytest.raises(ValueError, match="api_max_request_body_bytes"):
+        Settings(api_max_request_body_bytes=64 * 1024 * 1024 + 1)
+
+
 def test_provider_only_override_uses_isolated_database_on_shipped_profile():
     settings = load_settings(
         environ={"QUANT_MONITOR_DATA_PROVIDER": "mock"}
@@ -221,6 +247,23 @@ def test_default_configuration_uses_asharehub_daily_bars_and_soft_budget():
     assert settings.asharehub_daily_soft_limit == 90
     assert settings.asharehub_history_reserve_requests == 10
     assert settings.asharehub_retries == 0
+
+
+def test_fundamental_overlay_weight_is_configurable_and_public():
+    settings = load_settings(
+        environ={
+            "QUANT_MONITOR_BANK_STRATEGY_FUNDAMENTAL_WEIGHT": "0.35",
+        }
+    )
+
+    assert settings.bank_strategy_fundamental_weight == pytest.approx(0.35)
+    assert settings.public_dict()["bank_strategy"]["fundamental_weight"] == pytest.approx(0.35)
+
+
+@pytest.mark.parametrize("weight", [-0.01, 1.0, float("nan"), float("inf")])
+def test_fundamental_overlay_weight_rejects_invalid_values(weight):
+    with pytest.raises(ValueError):
+        Settings(bank_strategy_fundamental_weight=weight)
 
 
 @pytest.mark.parametrize("field", ["asharehub_api_key", "asharehub_key", "asharehub_token"])

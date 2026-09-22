@@ -25,15 +25,90 @@ from quant_monitor.data_sources.asharehub import (
     AShareHubAuthenticationError,
     AShareHubRateLimitError,
 )
-from quant_monitor.domain import Bar, Exchange, Instrument, SHANGHAI_TZ
+from quant_monitor.domain import Bar, Exchange, Instrument, Quote, SHANGHAI_TZ
 from quant_monitor.domain import (
     CollectionBatch,
     CollectionBatchStatus,
     normalized_request_hash,
     now_market_time,
 )
-from quant_monitor.runtime import ApplicationRuntime
+from quant_monitor.runtime import (
+    ApplicationRuntime,
+    build_calendar_readiness,
+    build_data_readiness,
+)
 from quant_monitor.universes import BANK_STOCK_SYMBOLS
+from quant_monitor.trading_calendar import VersionedSessionCalendar
+
+
+@pytest.mark.parametrize(
+    ("provider", "enabled", "source", "error", "expected_ready", "reason"),
+    [
+        ("mock", False, "weekday_fallback", None, True, "not_required"),
+        ("asharehub", True, "asharehub_cache", None, True, "exchange_calendar_loaded"),
+        ("asharehub", True, "asharehub_partial", "TradeCalendarPartialData", False, "exchange_calendar_unavailable"),
+        ("asharehub", True, "weekday_fallback", "TradeCalendarCacheExpired", False, "exchange_calendar_unavailable"),
+        ("asharehub", False, "weekday_fallback", None, False, "calendar_disabled"),
+    ],
+)
+def test_calendar_readiness_is_cache_only_and_fail_closed(
+    provider, enabled, source, error, expected_ready, reason
+):
+    result = build_calendar_readiness(
+        provider_name=provider,
+        calendar_enabled=enabled,
+        calendar_source=source,
+        calendar_error_type=error,
+        configured_symbols=2,
+    )
+    assert result["ready"] is expected_ready
+    assert result["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    "market_is_trading, state, received, expected, reason",
+    [
+        (False, "stale", 1, False, "market_closed_cached_close_allowed"),
+        (False, "stale", 2, True, "market_closed_cached_close_allowed"),
+        (False, "future_timestamp", 2, False, "market_closed_cached_close_allowed"),
+        (True, "untracked", 2, True, "fresh_quotes_required"),
+        (True, "fresh", 2, True, "fresh_quotes_required"),
+    ],
+)
+def test_data_readiness_uses_one_strict_full_coverage_rule(
+    market_is_trading, state, received, expected, reason
+):
+    readiness = build_data_readiness(
+        configured_symbols=2,
+        received_symbols=received,
+        freshness_state=state,
+        market_is_trading=market_is_trading,
+    )
+    assert readiness["ready"] is expected
+    assert readiness["reason"] == reason
+
+
+def test_runtime_builds_each_configured_profile_through_allowlisted_registry(tmp_path):
+    for profile, expected_attribute, expected_type in (
+        ("moving_average_cross", "strategies", "moving_average_cross"),
+        ("bank_daily_multifactor_v1", "cohort_strategies", "bank_daily_multifactor_v1"),
+    ):
+        runtime = ApplicationRuntime(
+            Settings(
+                data_provider="mock",
+                strategy_profile=profile,
+                database_path=str(tmp_path / (profile + ".sqlite3")),
+                watchlist=["600519.SH"],
+                bank_strategy_min_history=121,
+                bank_strategy_min_universe=2,
+            )
+        )
+        try:
+            strategies = getattr(runtime.monitor, expected_attribute)
+            assert len(strategies) == 1
+            assert strategies[0].name == expected_type
+        finally:
+            runtime.repository.close()
 
 
 def test_runtime_selects_asharehub_without_network_on_construction(tmp_path):
@@ -55,7 +130,242 @@ def test_runtime_selects_asharehub_without_network_on_construction(tmp_path):
         assert status["provider"]["mode"] == "http_polling"
         assert status["provider"]["quota"]["soft_limit"] == 90
         assert status["provider"]["capabilities"]["intraday_bars"] is False
+        assert status["calendar_readiness"]["ready"] is False
+        assert status["calendar_readiness"]["reason"] == "calendar_disabled"
         assert api_key not in json.dumps(status)
+        assert status["database"] == {"type": "sqlite", "state": "disconnected"}
+    finally:
+        runtime.repository.close()
+
+
+def test_runtime_calendar_view_is_shared_with_collector_and_has_no_network_side_effect(tmp_path):
+    runtime = ApplicationRuntime(
+        Settings(
+            data_provider="asharehub",
+            asharehub_api_key="unit-test-asharehub-key",
+            asharehub_trade_calendar_enabled=True,
+            asharehub_budget_path=str(tmp_path / "budget.json"),
+            database_path=str(tmp_path / "calendar-runtime.sqlite3"),
+            watchlist=["600519.SH", "000001.SZ"],
+        )
+    )
+    try:
+        provider = runtime.provider
+        now = provider._monotonic()
+        provider._trade_calendar_loaded_at = now
+        provider._trade_calendar["SSE"] = {
+            datetime(2026, 10, 2).date(): (True, None),
+            datetime(2026, 10, 5).date(): (False, datetime(2026, 10, 2).date()),
+            datetime(2026, 10, 6).date(): (True, datetime(2026, 10, 5).date()),
+        }
+        provider._trade_calendar["SZSE"] = dict(provider._trade_calendar["SSE"])
+        provider._trade_calendar_source = "asharehub_cache"
+        provider._trade_calendar_error_type = None
+        calendar = runtime.current_trading_calendar()
+        assert isinstance(calendar, VersionedSessionCalendar)
+        assert runtime.monitor.collector.trading_calendar is calendar
+        assert calendar.metadata.identifier == "asharehub_trade_calendar"
+        assert runtime.system_status()["calendar_readiness"]["ready"] is True
+    finally:
+        runtime.repository.close()
+
+
+def test_runtime_status_redacts_collection_error_text(tmp_path):
+    """Public health diagnostics expose type, never provider exception text."""
+
+    secret = "api-token-in-provider-response"
+    runtime = ApplicationRuntime(
+        Settings(
+            data_provider="mock",
+            database_path=str(tmp_path / "redaction.sqlite3"),
+            watchlist=["600519.SH"],
+        )
+    )
+    try:
+        runtime.monitor._last_error = (
+            "MockMarketDataError: upstream response contained {}".format(secret)
+        )
+        status = runtime.system_status()
+        collector = status["collector"]
+        assert collector["last_error_type"] == "MockMarketDataError"
+        assert collector["last_error"] == "collection failed (MockMarketDataError)"
+        assert secret not in json.dumps(status)
+    finally:
+        runtime.repository.close()
+
+
+def test_runtime_status_exposes_quote_freshness_without_provider_io(tmp_path):
+    runtime = ApplicationRuntime(
+        Settings(
+            data_provider="asharehub",
+            asharehub_api_key="unit-test-key",
+            asharehub_budget_path=str(tmp_path / "budget.json"),
+            database_path=str(tmp_path / "freshness.sqlite3"),
+            watchlist=["600519.SH", "600036.SH", "601318.SH"],
+        )
+    )
+    try:
+        runtime.quote_stale_after_seconds = 30.0
+        now = now_market_time()
+        runtime.monitor._latest_quotes = {
+            "600519.SH": Quote(
+                symbol="600519.SH",
+                timestamp=now - timedelta(seconds=90),
+                last="100",
+                source="asharehub",
+            ),
+            "600036.SH": Quote(
+                symbol="600036.SH",
+                timestamp=now + timedelta(seconds=30),
+                last="10",
+                source="asharehub",
+            ),
+        }
+        freshness = runtime.system_status()["provider"]["quote_freshness"]
+        assert freshness["configured_symbols"] == 3
+        assert freshness["received_symbols"] == 2
+        assert freshness["stale_symbols"] == 1
+        assert freshness["missing_symbols"] == 1
+        assert freshness["future_timestamp_symbols"] == 1
+        assert freshness["state"] == "future_timestamp"
+        assert freshness["threshold_seconds"] == 30.0
+        assert freshness["newest_timestamp"].endswith("+08:00")
+    finally:
+        runtime.repository.close()
+
+
+def test_runtime_status_exposes_asharehub_quote_response_quality(tmp_path):
+    """Response-shape diagnostics are explicit and aggregate in system status."""
+
+    runtime = ApplicationRuntime(
+        Settings(
+            data_provider="asharehub",
+            asharehub_api_key="unit-test-key",
+            asharehub_budget_path=str(tmp_path / "budget.json"),
+            database_path=str(tmp_path / "quality.sqlite3"),
+            watchlist=["600519.SH", "600036.SH", "601318.SH"],
+        )
+    )
+    try:
+        provider = runtime.provider
+        provider._last_quote_response_rows = 2
+        provider._last_quote_parsed_symbols = 1
+        provider._last_quote_dropped_rows = 1
+        provider._last_quote_invalid_rows = 1
+        provider._last_quote_unexpected_rows = 0
+        provider._last_quote_duplicate_rows = 0
+        provider._last_quote_conflict_rows = 0
+        provider._last_quote_missing_symbols = ("600036.SH", "601318.SH")
+        quality = runtime.system_status()["provider"]["quote_response_quality"]
+        assert quality["response_rows"] == 2
+        assert quality["parsed_symbols"] == 1
+        assert quality["dropped_rows"] == 1
+        assert quality["invalid_rows"] == 1
+        assert quality["unexpected_rows"] == 0
+        assert quality["duplicate_rows"] == 0
+        assert quality["conflict_rows"] == 0
+        assert quality["missing_symbols"] == ["600036.SH", "601318.SH"]
+        assert quality["missing_count"] == 2
+        assert quality["requested_symbols"] == 3
+        assert quality["coverage_ratio"] == pytest.approx(1 / 3, rel=1e-6)
+    finally:
+        runtime.repository.close()
+
+
+@pytest.mark.parametrize("provider_name", ["asharehub", "alltick", "akshare"])
+@pytest.mark.parametrize(
+    "is_trading, offset_seconds, expected_issue",
+    [
+        (False, 30, "quote_timestamp_future"),
+        (True, 30, "quote_timestamp_future"),
+        (False, 5, None),  # The documented clock-skew tolerance is inclusive.
+        (False, -3600, None),  # Prior-close snapshots are normal after hours.
+        (True, -3600, "quote_data_stale"),
+    ],
+)
+def test_runtime_future_quotes_degrade_health_even_outside_market_hours(
+    tmp_path, monkeypatch, provider_name, is_trading, offset_seconds, expected_issue
+):
+    """Quote integrity is independent from exchange opening hours; no I/O."""
+
+    now = datetime(2026, 8, 29, 0, 7, tzinfo=SHANGHAI_TZ)
+    monkeypatch.setattr("quant_monitor.runtime.now_market_time", lambda: now)
+    runtime = ApplicationRuntime(
+        Settings(
+            data_provider="mock",
+            database_path=str(tmp_path / "quote-health.sqlite3"),
+            watchlist=["600519.SH"],
+        )
+    )
+
+    class StatusOnlyProvider:
+        name = provider_name
+
+        def current_market_status(self):
+            return {"is_trading": is_trading}
+
+    runtime.provider = StatusOnlyProvider()
+    runtime.quote_stale_after_seconds = 30.0
+    quote = Quote(
+        symbol="600519.SH",
+        timestamp=now + timedelta(seconds=offset_seconds),
+        last="100",
+        source=provider_name,
+    )
+    monkeypatch.setattr(
+        runtime.monitor,
+        "current_snapshot",
+        lambda: {"running": True, "quotes": {quote.symbol: quote}},
+    )
+    try:
+        runtime.repository.initialize()
+        status = runtime.system_status()
+        issues = status["provider"]["issues"]
+        assert issues == ([expected_issue] if expected_issue else [])
+        assert status["healthy"] is (expected_issue is None)
+        assert status["status"] == ("degraded" if expected_issue else "ok")
+        assert status["provider"]["state"] == (
+            "degraded" if expected_issue else "running"
+        )
+        if expected_issue == "quote_timestamp_future":
+            assert status["provider"]["quote_freshness"]["state"] == "future_timestamp"
+            assert status["provider"]["quote_freshness"]["fresh_symbols"] == 0
+    finally:
+        runtime.repository.close()
+
+
+def test_runtime_status_exposes_data_readiness_for_open_market_without_quotes(
+    tmp_path,
+):
+    """A live process with an empty feed must not look data-ready to scrapers."""
+
+    runtime = ApplicationRuntime(
+        Settings(
+            data_provider="mock",
+            database_path=str(tmp_path / "data-readiness.sqlite3"),
+            watchlist=["600519.SH"],
+        )
+    )
+
+    class OpenMarketProvider:
+        name = "mock"
+
+        def current_market_status(self):
+            return {"is_trading": True}
+
+    runtime.provider = OpenMarketProvider()
+    runtime.monitor.current_snapshot = lambda: {
+        "running": True,
+        "quotes": {},
+    }
+    try:
+        runtime.repository.initialize()
+        readiness = runtime.system_status()["data_readiness"]
+        assert readiness["ready"] is False
+        assert readiness["reason"] == "fresh_quotes_required"
+        assert readiness["configured_symbols"] == 1
+        assert readiness["received_symbols"] == 0
+        assert readiness["market_is_trading"] is True
     finally:
         runtime.repository.close()
 
@@ -211,6 +521,11 @@ def test_runtime_asharehub_bank_start_does_not_wait_for_initial_http(tmp_path):
             startup = runtime.system_status()["startup"]
             assert startup["ready"] is True
             assert startup["ready_at"] is not None
+            assert startup["phase"] == "ready"
+            assert startup["started_at"] is not None
+            assert startup["duration_ms"] is not None
+            assert startup["duration_ms"] >= 0
+            assert startup["error_type"] is None
             assert startup["collection_mode"] == "background"
             history = startup["history_bootstrap"]
             assert history["state"] in {"scheduled", "running"}
@@ -391,6 +706,7 @@ def test_runtime_does_not_refetch_fresh_strategy_ready_partial_history(tmp_path)
             await runtime.start()
             await asyncio.sleep(0)
             assert runtime.system_status()["startup"]["research_ready"] is True
+            assert runtime.system_status()["startup"]["research_ready_reason"] == "minimum_history_coverage_met"
             assert calls == []
         finally:
             await runtime.stop()
@@ -660,6 +976,114 @@ def test_runtime_selects_akshare_provider_without_network_on_construction(tmp_pa
     asyncio.run(exercise())
 
 
+def test_runtime_akshare_catalogue_refresh_does_not_block_startup(tmp_path):
+    async def exercise():
+        runtime = ApplicationRuntime(
+            Settings(
+                data_provider="akshare",
+                database_path=str(tmp_path / "akshare-start.sqlite3"),
+                watchlist=["600519.SH"],
+                poll_interval_seconds=3600,
+            )
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_instruments():
+            entered.set()
+            await release.wait()
+            return []
+
+        async def no_quotes(symbols):
+            return []
+
+        async def no_bars(symbols, interval="1d", limit=200):
+            return []
+
+        runtime.provider.fetch_instruments = slow_instruments
+        runtime.provider.fetch_quotes = no_quotes
+        runtime.provider.fetch_bars_many = no_bars
+        try:
+            await asyncio.wait_for(runtime.start(), timeout=0.5)
+            assert runtime.system_status()["startup"]["phase"] == "ready"
+            await asyncio.wait_for(entered.wait(), timeout=0.5)
+            assert runtime._instrument_task is not None
+            assert not runtime._instrument_task.done()
+        finally:
+            release.set()
+            await runtime.stop()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_startup_failure_reports_phase_without_exception_message(
+    tmp_path, caplog
+):
+    async def exercise():
+        runtime = ApplicationRuntime(
+            Settings(
+                data_provider="mock",
+                database_path=str(tmp_path / "startup-failure.sqlite3"),
+                watchlist=["600519.SH"],
+            )
+        )
+
+        def fail_initialize():
+            raise RuntimeError("synthetic-sensitive-value")
+
+        runtime.repository.initialize = fail_initialize
+        with pytest.raises(RuntimeError, match="synthetic-sensitive-value"):
+            await runtime.start()
+        assert runtime._startup_phase == "failed"
+        assert runtime._startup_error_type == "RuntimeError"
+        assert runtime._startup_duration_ms is not None
+
+    caplog.set_level("INFO")
+    asyncio.run(exercise())
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "phase=database_initialize" in messages
+    assert "error_type=RuntimeError" in messages
+    assert "synthetic-sensitive-value" not in messages
+
+
+def test_runtime_database_initialization_timeout_is_bounded(tmp_path, caplog):
+    """A stale SQLite lock must fail startup with an actionable phase error."""
+
+    async def exercise():
+        runtime = ApplicationRuntime(
+            Settings(
+                data_provider="mock",
+                database_path=str(tmp_path / "startup-timeout.sqlite3"),
+                watchlist=["600519.SH"],
+                startup_database_timeout_seconds=0.05,
+            )
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_initialize():
+            entered.set()
+            release.wait(1.0)
+
+        runtime.repository.initialize = blocked_initialize
+        task = asyncio.create_task(runtime._initialize_repository_with_progress())
+        try:
+            assert await asyncio.to_thread(entered.wait, 1.0)
+            with pytest.raises(RuntimeError, match="timed out"):
+                await task
+        finally:
+            release.set()
+            # ``to_thread`` cannot interrupt an already-running worker. Give
+            # it a chance to finish before the test closes the repository.
+            await asyncio.sleep(0.1)
+            runtime.repository.close()
+
+    caplog.set_level("INFO")
+    asyncio.run(exercise())
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "phase=database_initialize status=timeout" in messages
+
+
 def test_runtime_keeps_mock_provider_available_for_offline_runs(tmp_path):
     async def exercise():
         runtime = ApplicationRuntime(
@@ -674,5 +1098,135 @@ def test_runtime_keeps_mock_provider_available_for_offline_runs(tmp_path):
             assert runtime.provider.name == "mock"
         finally:
             runtime.repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_revokes_readiness_when_collector_stops(tmp_path):
+    async def exercise():
+        runtime = ApplicationRuntime(
+            Settings(
+                data_provider="mock",
+                database_path=str(tmp_path / "stopped-collector.sqlite3"),
+                watchlist=["600519.SH"],
+                poll_interval_seconds=3600,
+            )
+        )
+        try:
+            await runtime.start()
+            assert runtime.system_status()["startup"]["serving_ready"] is True
+            await runtime.monitor.stop()
+            status = runtime.system_status()
+            assert status["startup"]["serving_ready"] is False
+            assert status["startup"]["ready"] is False
+            assert status["healthy"] is False
+            assert status["status"] == "degraded"
+            assert status["provider"]["state"] == "error"
+            assert "collector_stopped" in status["provider"]["issues"]
+        finally:
+            await runtime.stop()
+        status = runtime.system_status()
+        assert status["startup"]["phase"] == "stopped"
+        assert status["startup"]["serving_ready"] is False
+        assert status["status"] == "stopped"
+        assert status["healthy"] is False
+        assert status["database"]["state"] == "disconnected"
+
+    asyncio.run(exercise())
+
+
+def test_runtime_revokes_readiness_before_shutdown_awaits(tmp_path):
+    async def exercise():
+        runtime = ApplicationRuntime(
+            Settings(
+                data_provider="mock",
+                database_path=str(tmp_path / "stopping.sqlite3"),
+                watchlist=["600519.SH"],
+                poll_interval_seconds=3600,
+            )
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        close_provider = runtime.provider.close
+
+        async def slow_close():
+            entered.set()
+            await release.wait()
+            await close_provider()
+
+        await runtime.start()
+        runtime.provider.close = slow_close
+        stopping = asyncio.create_task(runtime.stop())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            status = runtime.system_status()
+            assert status["startup"]["phase"] == "stopping"
+            assert status["startup"]["serving_ready"] is False
+            assert status["status"] == "stopping"
+            assert status["healthy"] is False
+        finally:
+            release.set()
+            await stopping
+
+    asyncio.run(exercise())
+
+
+def test_runtime_revokes_readiness_when_database_is_disconnected(tmp_path):
+    async def exercise():
+        runtime = ApplicationRuntime(
+            Settings(
+                data_provider="mock",
+                database_path=str(tmp_path / "disconnected.sqlite3"),
+                watchlist=["600519.SH"],
+                poll_interval_seconds=3600,
+            )
+        )
+        try:
+            await runtime.start()
+            runtime.repository.close()
+            status = runtime.system_status()
+            assert status["collector"]["running"] is True
+            assert status["startup"]["serving_ready"] is False
+            assert status["healthy"] is False
+            assert status["status"] == "degraded"
+            assert "database_disconnected" in status["provider"]["issues"]
+        finally:
+            await runtime.stop()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_late_startup_failure_stops_activated_collector(tmp_path):
+    async def exercise():
+        runtime = ApplicationRuntime(
+            Settings(
+                data_provider="mock",
+                database_path=str(tmp_path / "activation-failure.sqlite3"),
+                watchlist=["600519.SH"],
+                poll_interval_seconds=3600,
+            )
+        )
+        complete_phase = runtime._complete_startup_phase
+
+        def fail_activation(phase, started, **details):
+            if phase == "service_activation":
+                assert runtime.monitor.running is True
+                raise RuntimeError("synthetic activation failure")
+            complete_phase(phase, started, **details)
+
+        runtime._complete_startup_phase = fail_activation
+        with pytest.raises(RuntimeError, match="synthetic activation failure"):
+            await runtime.start()
+        assert runtime.monitor.running is False
+        assert runtime.monitor._task is None
+        assert runtime.subscription is None
+        assert runtime.repository.initialized is False
+        status = runtime.system_status()
+        assert status["startup"]["phase"] == "failed"
+        assert status["startup"]["serving_ready"] is False
+        assert status["startup"]["ready_at"] is None
+        assert status["startup"]["error_type"] == "RuntimeError"
+        assert status["status"] == "error"
+        assert status["healthy"] is False
 
     asyncio.run(exercise())

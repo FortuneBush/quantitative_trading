@@ -65,10 +65,10 @@ AShareHub 银行目录的“策略最低样本”与“目录完整性”是两�
 
 ## 4. 一致性、并发与故障语义
 
-- SQLite 文件数据库启用 WAL、外键、5 秒 busy timeout 和 `synchronous=NORMAL`，适合单机、单应用进程下看板读与采集写并行；它不是高吞吐分布式时序数据库。
+- SQLite 文件数据库启用 WAL、外键和 `synchronous=NORMAL`，适合单机、单应用进程下看板读与采集写并行；它不是高吞吐分布式时序数据库。启动时会把 `startup_database_timeout_seconds` 同时传给 SQLite 连接和迁移器：锁等待、WAL 建立与迁移共享同一个有界期限，不会出现 ASGI 外层超时后后台 native SQLite 线程仍按默认 5 秒继续占锁的情况。普通运行时连接仍使用最多 5 秒 busy timeout；启动失败会记录 `database_initialize` 阶段及脱敏错误类型。
 - repository 使用进程内可重入锁保护共享连接。不要让多个独立应用实例同时承担采集主节点；若将来需要多进程，应拆分采集服务、API 服务并引入明确的消息和存储一致性方案。
 - 行情、K 线、指标的唯一键支持同一批次重试。当前唯一键不含 `source`，同一证券同一时间来自不同 provider 的记录会相互覆盖；接入多源行情前必须决定权威源或修改模式。
-- 告警和信号表使用自增 ID，没有业务唯一约束。策略信号只按 `(strategy, symbol, action, timestamp)` 在当前进程内抑制重复；进程重启或历史重放仍可能生成重复记录。
+- 告警和信号表使用自增 ID。策略信号以 `(strategy, symbol, action, timestamp)` 为确定性业务键，监控器先查进程内缓存并回查 SQLite 历史，服务重启或历史重放不会重复发布同一键；多个采集主节点并发写入仍被架构约束禁止，跨进程部署前需升级为原子唯一 claim。
 - EventBus 不是事务消息队列。当前流程通常先落库再发布，因此客户端漏掉事件后可用 REST 补拉；但事件没有游标、确认或重放机制。
 - 同一事件的订阅者并发执行，一个订阅者失败会被记录且不妨碍其他订阅者。WebSocket 单次发送超时为 1 秒，失败客户端会被移除。
 - `MonitoringService.current_snapshot()` 是进程快照，不是数据库事务快照。API 若需要跨表严格一致的切面，应另行实现读事务或批次 ID。
@@ -79,7 +79,7 @@ AShareHub 银行目录的“策略最低样本”与“目录完整性”是两�
 | --- | --- | --- |
 | `instruments` | `symbol` | 证券静态信息、上市日、最小价位、交易单位及扩展 metadata |
 | `quotes` | `symbol, timestamp` | 时点报价；`volume` / `turnover` 的累计口径需由 provider 明确 |
-| `bars` | `symbol, interval, timestamp` | OHLCV；AShareHub 收盘日线当前以交易日 15:30 标记保守可用时点，其他源必须在适配器内明确语义；未来 schema 仍需拆分 period/available/received 时间 |
+| `bars` | `symbol, interval, timestamp` | OHLCV；AShareHub 收盘日线当前以交易日 15:30 标记保守可用时点，适配器拒绝收盘前返回的当日部分行和未来时间戳，其他源必须在适配器内明确语义；未来 schema 仍需拆分 period/available/received 时间 |
 | `metrics` | `symbol, name, timestamp` | 指标值及窗口；周期目前放在 metadata 中 |
 | `alerts` | 自增 `id` | 采集或策略异常以及未来监控告警，可确认 |
 | `signals` | 自增 `id` | 研究信号及原因，不是订单 |
@@ -92,7 +92,14 @@ AShareHub 银行目录的“策略最低样本”与“目录完整性”是两�
 
 ### 6.1 交易日历与交易时段
 
-`quant_monitor.market.market_status()` 当前只把周一至周五视为交易日，标识 09:15–09:25 开盘集合竞价、09:30–11:30 和 13:00–14:57 连续竞价、14:57–15:00 收盘集合竞价。它明确返回 `calendar: "weekday_fallback"`，不能识别法定节假日调休、交易所临时休市、特定证券停牌或产品差异。
+`quant_monitor.market.market_status()` 当前只把周一至周五视为交易日，标识 09:15–09:25 开盘集合竞价、09:30–11:30 和 13:00–14:57 连续竞价、14:57–15:00 收盘集合竞价。它明确返回 `calendar: "weekday_fallback"`，不能识别法定节假日调休、交易所临时休市、特定证券停牌或产品差异。AShareHub 生产配置另以 7 天本地缓存接入 `/v2/reference/trade-calendar`，按 SSE/SZSE 分端点校验 `cal_date`、`is_open` 和 `pretrade_date`；缓存命中时覆盖该 provider 的报价与日线新鲜度判断，失效、额度保护或接口失败则保留并公开 `weekday_fallback` 降级状态。
+
+AShareHub 日历响应和本地缓存中的同一交易所/日期重复行必须完全一致；相同重复会去重，`is_open` 或 `pretrade_date` 冲突则整次日历加载 fail-closed 并回退到 `weekday_fallback`，避免让不稳定的上游行顺序决定交易日语义。
+
+当 provider 的缓存确实回答了当前证券日期时，状态会披露 `calendar_exchange` 和
+`calendar_lookup=open|closed`；若缓存已加载但日期落在有限覆盖范围之外，则状态明确为
+`calendar_lookup=unknown` 并恢复 `weekday_fallback` 血缘。未知日期不能沿用缓存来源标签，
+否则容易把“没有记录”误读成交易所确认的休市或开市。
 
 接入真实数据前，应导入上交所、深交所、北交所公布的年度休市安排及后续临时通知，并保存“交易所 + 交易日期 + 各时段 + 版本/来源”。周末调休上班日通常也不是交易日，不能套用中国大陆工作日日历。调度器、K 线切分、指标窗口和回测应共享同一份版本化交易日历；不要仅凭本地时钟决定数据是否缺失。
 
@@ -137,7 +144,23 @@ AShareHub 银行目录的“策略最低样本”与“目录完整性”是两�
 
 `VersionedSessionCalendar` 可接收有序、唯一的离线日期集合并保留调用方声明的 `source`、`version` 和 `identifier`，用于可复现实验及节假日测试。它是有限覆盖日历：所有日期和区间查询只要越过首末覆盖日就抛出 `CalendarRangeError`，不能把覆盖外的“未知”静默解释成休市或截断到已有日期。但这些字符串不构成来源认证，该实现同样固定为 `verified=false`，不能声称已经接入官方交易所日历。当前市场状态、质量审计和回测还会强制对外报告 `calendar_verified=false`，不会信任任意结构化 `TradingCalendar` 实现传入的真值。未来的正式实现应由受控导入流程核验交易所公告、覆盖范围和内容版本，并引入独立的认证证据，而不是允许业务调用方自行把标志设为真。
 
+`VersionedSessionCalendar.to_snapshot()` 可导出严格的 JSON 兼容快照，包含有序日期、来源标签、版本和 SHA-256 `fingerprint`；`from_snapshot()` 会拒绝缺失/未知字段、非规范日期、重复日期、版本漂移或指纹不匹配。指纹用于研究结果的可复现性和缓存隔离，不是交易所签名，仍不会把 `calendar_verified` 变为真。`market_status` 对此类日历额外返回 `calendar_fingerprint`，对无指纹的降级日历返回 `null`。
+
+快照文件通过 `load_calendar_snapshot()` 做重复键检测和完整指纹校验；调用方还可传入
+`expected_fingerprint`、`expected_identifier`、`expected_source`、`expected_version`，
+把导入绑定到部署/研究清单声明的具体修订；任何合法但身份不匹配的文件都会失败关闭。
+`CalendarSnapshotStore` 使用指纹文件名追加保存修订，并拒绝覆盖已有不同内容的路径。
+因此研究运行可以固定引用一个不可变本地日历文件；这仍不是官方来源认证，未知文件或
+指纹不一致会失败关闭，不会静默回退到工作日规则。
+离线导入还可通过 `VersionedSessionCalendar.from_weekday_rules()` 显式表达法定休市与
+周末调休开市；范围外、冲突或无效的例外（周末休市、工作日调休）会被拒绝，避免把
+自然日规则误当成交易所会话或因拼写错误静默改变日历。
+
 日线质量审计除了按日历计算缺失窗口，还会单独报告 `off_calendar_date_count` / `off_calendar_dates`。非会话日 K 线不会计入可用历史，并至少把该证券标为 `warning`、整体结果降级，避免完整窗口掩盖周末或休市日的异常记录。
+
+研究结果还提供独立的指标一致性审计（`backtesting.integrity`）。它从不可变净值曲线和成交
+台账重新计算聚合绩效与风险指标，并核对逐点收益/回撤；结果 JSON 的哈希仅证明制品未被修改，
+不能替代该计算审计。审计为只读、纯离线，不会改变 `decision_grade`，也不会访问行情 provider。
 
 推荐按以下顺序扩展：
 

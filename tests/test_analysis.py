@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from dataclasses import replace
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -17,10 +18,14 @@ from quant_monitor.config import Settings
 from quant_monitor.data_sources import AkShareDataError
 from quant_monitor.domain import Bar, Quote, parse_market_time
 from quant_monitor.services import QuantitativeAnalysisService
+from quant_monitor.trading_calendar import VersionedSessionCalendar
 
 
 def _bars(count: int, *, descending: bool = False):
-    start = parse_market_time("2026-08-12T09:30:00+08:00")
+    # Keep the synthetic history before the quote/as-of times used below;
+    # analysis now correctly rejects future-dated bars instead of treating
+    # them as fresh research evidence.
+    start = parse_market_time("2026-05-24T09:30:00+08:00")
     values = []
     for index in range(count):
         # A deterministic rising series makes trend and momentum assertions
@@ -201,6 +206,65 @@ def test_fresh_quote_does_not_hide_stale_daily_history():
     assert snapshot.data_quality["bar_stale"] is True
 
 
+def test_daily_analysis_uses_injected_calendar_and_discloses_its_identity():
+    # This is a synthetic weekday closure, not an exchange holiday claim.
+    calendar = VersionedSessionCalendar.from_weekday_rules(
+        date(2026, 5, 1), date(2026, 8, 31),
+        holidays=(date(2026, 8, 12),), source="offline-fixture", version="1",
+    )
+    bars = _bars(80)
+    bars[-1] = replace(
+        bars[-1], timestamp=parse_market_time("2026-08-11T15:00:00+08:00")
+    )
+    now = parse_market_time("2026-08-12T16:00:00+08:00")
+
+    snapshot = QuantitativeAnalysisService(calendar=calendar).analyze(
+        "600519.SH", bars, now=now
+    )
+    fallback = QuantitativeAnalysisService().analyze("600519.SH", bars, now=now)
+
+    assert snapshot.data_quality["status"] == "ok"
+    assert snapshot.stale is False
+    assert snapshot.data_quality["expected_bar_date"] == "2026-08-11"
+    assert snapshot.data_quality["calendar_source"] == "offline-fixture"
+    assert snapshot.data_quality["calendar_fingerprint"] == calendar.fingerprint
+    assert snapshot.data_quality["calendar_verified"] is False
+    assert snapshot.data_quality["calendar_out_of_coverage"] is False
+    assert fallback.data_quality["bar_stale"] is True
+    assert fallback.data_quality["calendar"] == "weekday_fallback"
+    assert fallback.data_quality["calendar_verified"] is False
+
+
+def test_analysis_calendar_coverage_failure_does_not_fall_back_or_recommend():
+    calendar = VersionedSessionCalendar.from_weekday_rules(
+        date(2026, 5, 1), date(2026, 8, 14),
+        source="offline-fixture", version="1",
+    )
+    service = QuantitativeAnalysisService(calendar=calendar)
+    now = parse_market_time("2026-08-17T16:00:00+08:00")
+
+    snapshot = service.analyze("600519.SH", _bars(80), now=now)
+
+    assert snapshot.stale is True
+    assert snapshot.data_quality["status"] == "calendar_out_of_coverage"
+    assert snapshot.data_quality["expected_bar_date"] is None
+    assert snapshot.data_quality["calendar_out_of_coverage"] is True
+    assert snapshot.data_quality["calendar_fingerprint"] == calendar.fingerprint
+    assert snapshot.recommendation["action"] == "insufficient_data"
+    assert snapshot.recommendation["label"] == "交易日历覆盖不足"
+
+    # Intraday age checks do not depend on a session-date snapshot.
+    intraday = replace(_bars(1)[0], interval="1m", timestamp=now)
+    snapshot = service.analyze("600519.SH", [intraday], now=now)
+    assert snapshot.stale is False
+    assert "calendar_out_of_coverage" not in snapshot.data_quality
+
+
+def test_analysis_rejects_non_calendar_injection():
+    with pytest.raises(TypeError, match="calendar must implement TradingCalendar"):
+        QuantitativeAnalysisService(calendar=object())
+
+
 def test_analysis_api_supports_single_and_batch_mock_requests(tmp_path):
     settings = Settings(
         database_path=str(tmp_path / "analysis.sqlite3"),
@@ -222,6 +286,15 @@ def test_analysis_api_supports_single_and_batch_mock_requests(tmp_path):
         assert body["source"] == "mock"
         assert "trend" in body and "risk" in body
         assert body["recommendation"]["signal_only"] is True
+        assert body["data_provenance"]["authoritative"] is False
+        assert body["data_quality"]["observation_authority"] == "legacy_bars_projection"
+        assert body["data_quality"]["decision_ready"] is False
+        assert body["data_quality"]["decision_ready_reason"] == (
+            "immutable_observation_lineage_incomplete"
+        )
+        assert body["research_action"] == "insufficient_data"
+        assert body["recommendation"]["action"] == "insufficient_data"
+        assert body["recommendation"]["model_action"] is not None
 
         batch = client.get(
             "/api/v1/analysis",

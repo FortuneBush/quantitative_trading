@@ -11,7 +11,24 @@ function Write-LauncherMessage {
 $ResetCredential = $false
 $SmokeOnly = $false
 $SelectedProvider = "asharehub"
+$ProviderExplicit = $false
+# A non-empty provider environment value is an intentional override.  Keep an
+# empty inherited variable from poisoning config loading (the Python loader
+# quite correctly rejects an empty provider name).
+if (-not [string]::IsNullOrWhiteSpace($env:QUANT_MONITOR_DATA_PROVIDER)) {
+    $SelectedProvider = ([string]$env:QUANT_MONITOR_DATA_PROVIDER).Trim().ToLowerInvariant()
+    $ProviderExplicit = $true
+}
 $CustomConfigSupplied = $false
+$ConfigPath = $null
+# ``load_settings`` also accepts QUANT_MONITOR_CONFIG_PATH.  Treat it as a
+# custom profile here so provider credential and per-provider database routing
+# agree with the configuration Python will load, even when no --config flag is
+# passed to the launcher.
+if (-not [string]::IsNullOrWhiteSpace($env:QUANT_MONITOR_CONFIG_PATH)) {
+    $CustomConfigSupplied = $true
+    $ConfigPath = [string]$env:QUANT_MONITOR_CONFIG_PATH
+}
 $AppArguments = New-Object System.Collections.Generic.List[string]
 for ($Index = 0; $Index -lt $args.Count; $Index++) {
     $Argument = [string]$args[$Index]
@@ -46,6 +63,7 @@ for ($Index = 0; $Index -lt $args.Count; $Index++) {
             }
             $Index++
             $SelectedProvider = ([string]$args[$Index]).Trim().ToLowerInvariant()
+            $ProviderExplicit = $true
             continue
         }
         "-Provider" {
@@ -54,6 +72,7 @@ for ($Index = 0; $Index -lt $args.Count; $Index++) {
             }
             $Index++
             $SelectedProvider = ([string]$args[$Index]).Trim().ToLowerInvariant()
+            $ProviderExplicit = $true
             continue
         }
         "-NoBrowser" {
@@ -75,6 +94,7 @@ for ($Index = 0; $Index -lt $args.Count; $Index++) {
             }
             $Index++
             $CustomConfigSupplied = $true
+            $ConfigPath = [string]$args[$Index]
             $AppArguments.Add("--config")
             $AppArguments.Add([string]$args[$Index])
             continue
@@ -82,9 +102,43 @@ for ($Index = 0; $Index -lt $args.Count; $Index++) {
         default {
             if ($Argument.StartsWith("--config=", [StringComparison]::Ordinal)) {
                 $CustomConfigSupplied = $true
+                $ConfigPath = $Argument.Substring("--config=".Length)
             }
             $AppArguments.Add($Argument)
         }
+    }
+}
+
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+# With no explicit provider override, let a custom JSON profile select its
+# provider.  This is intentionally done in PowerShell so Git Bash/CMD and the
+# native Windows entry point share exactly the same credential and DB routing.
+if (-not $ProviderExplicit -and $CustomConfigSupplied) {
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        throw "--config requires a JSON configuration path."
+    }
+    $ConfigFilePath = $ConfigPath
+    if (-not [IO.Path]::IsPathRooted($ConfigFilePath)) {
+        $ConfigFilePath = Join-Path $ProjectRoot $ConfigFilePath
+    }
+    if (-not (Test-Path -LiteralPath $ConfigFilePath -PathType Leaf)) {
+        throw "configuration file does not exist: $ConfigPath"
+    }
+    try {
+        $ConfigPayload = Get-Content -LiteralPath $ConfigFilePath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "configuration file is not valid JSON: $ConfigPath"
+    }
+    $ConfigProvider = if ($null -ne $ConfigPayload) {
+        [string]$ConfigPayload.data_provider
+    }
+    else {
+        ""
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ConfigProvider)) {
+        $SelectedProvider = $ConfigProvider.Trim().ToLowerInvariant()
     }
 }
 
@@ -98,12 +152,16 @@ if ($ResetCredential -and $SelectedProvider -notin @("asharehub", "alltick")) {
     throw "Credential reset is available only for asharehub or alltick."
 }
 
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
-# The one-click launcher is deterministic: inherited provider variables from an
-# old CMD session must not silently switch it back to AKShare. Alternative
-# providers require an explicit ``--provider`` launcher argument.
-$env:QUANT_MONITOR_DATA_PROVIDER = $SelectedProvider
+# Only an explicit CLI/environment override is exported.  Otherwise the
+# selected value came from the JSON profile (or the default) and Python should
+# load the same profile without an environment value taking precedence.
+if ($ProviderExplicit) {
+    $env:QUANT_MONITOR_DATA_PROVIDER = $SelectedProvider
+}
+else {
+    Remove-Item Env:\QUANT_MONITOR_DATA_PROVIDER -ErrorAction SilentlyContinue
+}
 # The current market-data primary keys do not include ``source``.  Keep every
 # provider in its own database unless the caller deliberately supplied a path;
 # otherwise a mock/compatibility launch could overwrite same-key AShareHub rows.
@@ -245,6 +303,22 @@ try {
         throw "AShareHub API key is unavailable. Run scripts\start.cmd --reset-key."
     }
 
+    # Keep the readiness hint aligned with the port forwarded to the Python
+    # CLI. This is display-only; the CLI remains the source of truth for
+    # argument validation and binding.
+    $DisplayPort = "8000"
+    for ($DisplayIndex = 0; $DisplayIndex -lt $AppArguments.Count; $DisplayIndex++) {
+        $DisplayArgument = [string]$AppArguments[$DisplayIndex]
+        if ($DisplayArgument -eq "--port" -and $DisplayIndex + 1 -lt $AppArguments.Count) {
+            $DisplayPort = [string]$AppArguments[$DisplayIndex + 1]
+            break
+        }
+        if ($DisplayArgument.StartsWith("--port=", [StringComparison]::Ordinal)) {
+            $DisplayPort = $DisplayArgument.Substring("--port=".Length)
+            break
+        }
+    }
+
     $DependencyProbe = if ($SelectedProvider -in @("akshare", "alltick")) {
         "import fastapi, uvicorn, akshare, websockets"
     }
@@ -268,6 +342,10 @@ try {
         & $Python (Join-Path $ProjectRoot "scripts\smoke_asharehub.py") "--symbols" "600519.SH"
     }
     else {
+        Write-LauncherMessage (
+            "Server runs in this window. Wait for 'Application startup complete'; " +
+            ("open http://127.0.0.1:{0}/ready for readiness, and press Ctrl+C to stop." -f $DisplayPort)
+        )
         & $Python "-m" "quant_monitor" @AppArguments
     }
     $ExitCode = $LASTEXITCODE
