@@ -41,6 +41,7 @@ from quant_monitor.domain import (
     Instrument,
     Quote,
     SHANGHAI_TZ,
+    SecurityType,
     Signal,
     SignalAction,
     now_market_time,
@@ -1401,10 +1402,132 @@ def test_instruments_default_is_cache_only_and_refresh_is_explicit(client):
     provider.fetch_instruments = original
     refreshed = client.get("/api/v1/instruments", params={"refresh": "true"})
     assert refreshed.status_code == 200
-    assert refreshed.json()["served_from"] == "provider_refresh"
-    assert refreshed.json()["refresh_requested"] is True
+    refreshed_body = refreshed.json()
+    assert refreshed_body["served_from"] == "provider_refresh"
+    assert refreshed_body["refresh_requested"] is True
+    assert refreshed_body["catalogue"]["served_from"] == "provider_refresh"
+    assert refreshed_body["catalogue"]["refresh_requested"] is True
+    assert refreshed_body["catalogue"]["total"] == refreshed_body["catalogue_total"]
+    assert refreshed_body["catalogue"]["active"] + refreshed_body["catalogue"]["inactive"] == refreshed_body["catalogue_total"]
     assert refreshed.headers["Deprecation"] == "true"
     assert refreshed.headers["Link"].startswith("</api/v1/quote-refresh/jobs>")
+
+
+def test_instruments_catalogue_supports_cache_only_filters_pagination_and_sort(client):
+    """Catalogue lookup is local and deterministic, including inactive rows."""
+
+    repository = client.app.state.runtime.repository
+    # The application fixture may have hydrated the provider's bootstrap
+    # catalogue before the request.  Isolate this contract test so the
+    # catalogue totals describe exactly the rows inserted below.
+    repository.clear_instruments()
+    repository.upsert_instruments(
+        [
+            Instrument(
+                "300750.SZ",
+                "宁德时代",
+                Exchange.SZ,
+                SecurityType.STOCK,
+                active=True,
+                metadata={"source": "mock", "industry": "电池", "cnspell": "ndsd"},
+            ),
+            Instrument(
+                "000300.SH",
+                "沪深300",
+                Exchange.SH,
+                SecurityType.INDEX,
+                active=True,
+                metadata={"source": "mock", "industry": "指数", "cnspell": "hs300"},
+            ),
+            Instrument(
+                "430047.BJ",
+                "诺思兰德",
+                Exchange.BJ,
+                SecurityType.STOCK,
+                active=False,
+                metadata={"source": "mock", "industry": "医药", "cnspell": "nsld"},
+            ),
+        ]
+    )
+    provider = client.app.state.runtime.provider
+    original = provider.fetch_instruments
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("catalogue filters must not call provider")
+
+    provider.fetch_instruments = fail_if_called
+    try:
+        response = client.get(
+            "/api/v1/instruments",
+            params={
+                "search": "ndsd",
+                "exchange": "sz",
+                "security_type": "stock",
+                "active_only": "true",
+                "limit": 1,
+                "offset": 0,
+                "sort": "name",
+                "order": "asc",
+            },
+        )
+    finally:
+        provider.fetch_instruments = original
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["count"] == 1
+    assert body["total"] == 1
+    assert body["catalogue_total"] == 3
+    assert body["limit"] == 1
+    assert body["offset"] == 0
+    assert body["has_more"] is False
+    assert body["served_from"] == "sqlite_cache"
+    assert body["refresh_requested"] is False
+    assert body["catalogue"]["source"] == "mock"
+    assert body["catalogue"]["served_from"] == "sqlite_cache"
+    assert body["catalogue"]["refresh_requested"] is False
+    assert body["catalogue"]["total"] == 3
+    assert body["catalogue"]["active"] == 2
+    assert body["catalogue"]["inactive"] == 1
+    assert body["items"][0]["symbol"] == "300750.SZ"
+
+    inactive = client.get(
+        "/api/v1/instruments",
+        params={"exchange": "BJ", "active": "false", "limit": 10},
+    )
+    assert inactive.status_code == 200, inactive.text
+    assert inactive.json()["total"] == 1
+    assert inactive.json()["items"][0]["symbol"] == "430047.BJ"
+
+    # ``active`` is the preferred spelling and wins over the compatibility
+    # alias when both are supplied.
+    active_precedence = client.get(
+        "/api/v1/instruments",
+        params={"active": "true", "active_only": "false", "limit": 10},
+    )
+    assert active_precedence.status_code == 200, active_precedence.text
+    assert all(item["active"] is True for item in active_precedence.json()["items"])
+
+
+@pytest.mark.parametrize(
+    "params, error_code",
+    [
+        ({"limit": 0}, "validation_error"),
+        ({"limit": 5001}, "validation_error"),
+        ({"offset": -1}, "validation_error"),
+        ({"exchange": "XX"}, "http_error"),
+        ({"security_type": "warrant"}, "http_error"),
+        ({"sort": "market_cap"}, "http_error"),
+        ({"order": "sideways"}, "http_error"),
+        ({"active": "maybe"}, "validation_error"),
+    ],
+)
+def test_instruments_catalogue_rejects_invalid_query_parameters(
+    client, params, error_code
+):
+    response = client.get("/api/v1/instruments", params=params)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == error_code
 
 
 def test_bank_sector_endpoint_is_cached_only_and_exposes_coverage(client):

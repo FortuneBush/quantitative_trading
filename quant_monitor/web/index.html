@@ -107,6 +107,43 @@
         <p id="sector-treemap-note" class="panel-note">行业分类和个股快照仅读取本地缓存；点击个股可查看下方价格走势与研究分析。</p>
       </section>
 
+      <section id="catalogue-panel" class="panel catalogue-panel" aria-labelledby="catalogue-title">
+        <header class="panel-header">
+          <div>
+            <p class="panel-kicker">SECURITY MASTER</p>
+            <h2 id="catalogue-title">全市场证券目录 <small>名称、代码与交易状态</small></h2>
+          </div>
+          <div class="catalogue-meta">
+            <span id="catalogue-source" class="status-pill neutral"><i></i><span>读取目录中</span></span>
+            <span id="catalogue-count" class="count-badge">— 只</span>
+          </div>
+        </header>
+        <div id="catalogue-toolbar" class="catalogue-toolbar" role="search" aria-label="全市场证券目录检索">
+          <label class="catalogue-search"><span class="sr-only">搜索证券名称或代码</span><input id="catalogue-search" type="search" inputmode="search" autocomplete="off" placeholder="搜索名称 / 代码（如 600519 或 茅台）"></label>
+          <label><span class="sr-only">交易所筛选</span><select id="catalogue-exchange"><option value="all">全部交易所</option><option value="SH">沪市 SH</option><option value="SZ">深市 SZ</option><option value="BJ">北交所 BJ</option></select></label>
+          <label><span class="sr-only">证券类型筛选</span><select id="catalogue-type"><option value="all">全部类型</option><option value="stock">股票</option><option value="etf">ETF</option><option value="fund">基金</option><option value="index">指数</option><option value="bond">债券</option><option value="other">其他</option></select></label>
+          <label><span class="sr-only">上市状态筛选</span><select id="catalogue-status"><option value="all">全部状态</option><option value="active">正常上市</option><option value="inactive">非活跃 / 已退市</option></select></label>
+          <button id="catalogue-refresh" class="secondary-button" type="button" title="显式刷新供应商证券目录，可能消耗一次 API 额度">刷新目录</button>
+        </div>
+        <div class="catalogue-summary" aria-live="polite">
+          <p id="catalogue-note" class="panel-note">目录默认读取本地 SQLite 缓存；检索、筛选和分页不会访问上游。</p>
+          <span id="catalogue-coverage" class="catalogue-coverage">覆盖率 —</span>
+        </div>
+        <div class="table-scroll catalogue-table-scroll">
+          <table class="catalogue-table">
+            <caption class="sr-only">全市场证券目录；点击证券可查看行情与研究分析</caption>
+            <thead><tr><th scope="col">证券名称 / 代码</th><th scope="col">交易所</th><th scope="col">类型</th><th scope="col">上市日期</th><th scope="col">状态</th></tr></thead>
+            <tbody id="catalogue-body"><tr><td colspan="5"><div class="inline-loader"><i></i>正在读取本地证券目录…</div></td></tr></tbody>
+          </table>
+        </div>
+        <footer class="catalogue-pagination" aria-label="证券目录分页">
+          <button id="catalogue-prev" class="icon-button" type="button" aria-label="上一页" disabled>‹</button>
+          <span id="catalogue-page" class="catalogue-page">第 1 / 1 页</span>
+          <button id="catalogue-next" class="icon-button" type="button" aria-label="下一页" disabled>›</button>
+          <label class="catalogue-page-size"><span>每页</span><select id="catalogue-page-size" aria-label="每页显示数量"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option></select><span>条</span></label>
+        </footer>
+      </section>
+
       <section class="insights-grid" aria-label="银行板块广度与量化分析">
         <section class="panel market-insights-panel" aria-labelledby="market-insights-title">
           <header class="panel-header">
@@ -322,6 +359,7 @@
           <ul class="endpoint-list">
             <li><code>GET /api/v1/sectors/banks</code><span>银行板块聚合缓存、排名与分析</span></li>
             <li><code>GET /api/v1/market/treemap</code><span>行业与个股矩形树图缓存（不调用上游）</span></li>
+            <li><code>GET /api/v1/instruments</code><span>全市场证券目录（默认本地缓存，refresh=true 才刷新）</span></li>
             <li><code>GET /api/v1/overview</code><span>通用市场概览兼容接口</span></li>
             <li><code>GET /api/v1/market/quotes</code><span>缓存市场行情（refresh=true 才可能消耗额度）</span></li>
             <li><code>GET /api/v1/watchlist</code><span>自选批量行情快照</span></li>
@@ -344,6 +382,7 @@
   <script src="/static/bank-research.js" defer></script>
   <script src="/static/research-report.js" defer></script>
   <script src="/static/treemap.js" defer></script>
+  <script src="/static/catalogue.js" defer></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

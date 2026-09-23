@@ -632,7 +632,70 @@ naive datetime 会被拒绝，避免跨时区日期改变成本归属。
 
 ### `GET /api/v1/instruments`
 
-返回当前 provider 可识别的证券基础信息；`symbols` 可传逗号分隔代码进行过滤。默认只读 SQLite，返回 `served_from=sqlite_cache` 且不会调用供应商。只有显式传入 `refresh=true` 才允许 AShareHub 调用 `/v2/reference/stocks`（可能消耗一次额度），响应同时给出 `provider`、`universe_scope` 和 `refresh_requested`。AllTick 模式仍只返回配置股票池。
+返回当前 provider 已收录的证券主数据。AShareHub 的 `refresh=true` 会调用
+`/v2/reference/stocks` 并将全市场目录持久化到 SQLite；这是唯一允许该接口访问上游的方式，
+可能消耗一次 AShareHub 日额度。默认 `refresh=false`，以及搜索、排序、分页和页面重复刷新，
+都只读本地缓存，不消耗额度。AllTick/AKShare/mock 的目录范围由对应 provider 决定，不能把
+配置自选列表误认为全市场目录。
+
+查询参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `symbols` | 无 | 逗号分隔的规范证券代码；与其他筛选条件叠加 |
+| `search` | 无 | 按代码、名称、拼音或行业不区分大小写搜索；支持中文片段 |
+| `exchange` | 无 | `SH`、`SZ` 或 `BJ` |
+| `security_type` | 无 | `stock`、`etf`、`index`、`bond`、`fund` 或 `other` |
+| `active` | 无 | 是否为当前有效证券；`true`/`false`。同时传入时优先于 `active_only` |
+| `active_only` | 无 | `active` 的兼容别名 |
+| `limit` | 5000 | 单页条数，范围 1–5000；默认保留旧接口的一次返回全目录行为 |
+| `offset` | 0 | 非负偏移 |
+| `sort` | `symbol` | `symbol`、`name`、`exchange`、`security_type`、`listed_at`、`industry` 或 `active` |
+| `order` | `asc` | `asc` 或 `desc` |
+| `refresh` | `false` | 显式允许 provider 刷新目录；不绕过本地额度、缓存和完整性校验 |
+
+成功响应保留 `items`、`count`、`provider`、`universe_scope`、`served_from` 和
+`refresh_requested` 字段，并增加分页与目录统计：
+
+```json
+{
+  "items": [
+    {
+      "symbol": "600519.SH",
+      "name": "贵州茅台",
+      "exchange": "SH",
+      "security_type": "stock",
+      "active": true,
+      "metadata": {"industry": "白酒", "source": "asharehub"}
+    }
+  ],
+  "count": 1,
+  "total": 1,
+  "catalogue_total": 5342,
+  "limit": 100,
+  "offset": 0,
+  "has_more": false,
+  "provider": "asharehub",
+  "universe_scope": "provider_catalogue",
+  "served_from": "sqlite_cache",
+  "refresh_requested": false,
+  "catalogue": {
+    "source": "asharehub",
+    "as_of": "2026-08-12T10:00:00+08:00",
+    "total": 5342,
+    "active": 5328,
+    "inactive": 14,
+    "served_from": "sqlite_cache",
+    "refresh_requested": false
+  }
+}
+```
+
+`count` 是当前页条数，`total` 是筛选后的总条数，`catalogue_total` 和
+`catalogue.total` 是筛选前的目录总数。`active` 统计包含已退市/暂停等无效主数据行，
+便于审计目录是否完整；默认结果包含 active 与 inactive 行，只有显式设置 `active=true`
+或 `active_only=true` 才仅返回有效证券。目录是证券主数据，不代表当前有报价、可交易或具有
+基本面/历史数据；需要报价时使用 `/api/v1/quotes` 或 `/api/v1/market/quotes`。
 
 ### `GET /api/v1/overview`
 

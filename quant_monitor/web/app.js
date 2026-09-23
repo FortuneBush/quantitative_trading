@@ -2454,6 +2454,13 @@ function quantMonitorFreshnessSummary(states) {
   }
 
   function bindEvents() {
+    // The security-master panel is a separate cache-only module.  Reuse the
+    // dashboard's existing selection path so a catalogue click updates the
+    // quote, chart and explainable-research panels together.
+    window.addEventListener("quant-monitor:select-symbol", (event) => {
+      const symbol = event && event.detail ? event.detail.symbol : null;
+      if (symbol) selectSymbol(symbol).catch(() => {});
+    });
     dom.refresh.addEventListener("click", () => refreshAll({ notify: true }));
     dom.collectNow?.addEventListener("click", collectLatest);
     dom.researchCompare?.addEventListener("click", compareSelectedResearchRuns);

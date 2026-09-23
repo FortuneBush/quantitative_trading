@@ -135,6 +135,15 @@ BATCH_QUOTE_SORTS = {
     "timestamp",
     "updated_at",
 }
+INSTRUMENT_SORTS = {
+    "symbol",
+    "name",
+    "exchange",
+    "security_type",
+    "listed_at",
+    "industry",
+    "active",
+}
 LINEAGE_BATCH_MAX_LIMIT = 200
 LINEAGE_OBSERVATION_MAX_LIMIT = 500
 LINEAGE_MAX_OFFSET = 1_000_000
@@ -146,6 +155,94 @@ RESEARCH_RESULTS_EXPANDED_MAX_LIMIT = 20
 # local rate/budget gate).  ``Retry-After`` is a minimum client backoff hint,
 # not a promise that a quota will reset in five seconds.
 PROVIDER_RETRY_AFTER_SECONDS = 5
+
+
+def _filter_instrument_catalogue(
+    items: Sequence[Any],
+    *,
+    search: Optional[str] = None,
+    exchange: Optional[str] = None,
+    security_type: Optional[str] = None,
+    active: Optional[bool] = None,
+    sort: str = "symbol",
+    order: str = "asc",
+) -> List[Any]:
+    """Filter and sort cached security-master rows without provider I/O.
+
+    Instrument catalogues are small enough for this read-side projection to
+    run in memory, while keeping the repository contract stable for existing
+    callers.  Provider metadata is intentionally treated as untrusted text:
+    search only inspects a bounded set of display fields and never evaluates
+    arbitrary JSON values.
+    """
+
+    normalized_exchange = str(exchange or "").strip().upper() or None
+    if normalized_exchange is not None and normalized_exchange not in {"SH", "SZ", "BJ"}:
+        raise ValueError("exchange must be one of: SH, SZ, BJ")
+    normalized_type = str(security_type or "").strip().lower() or None
+    allowed_types = {"stock", "etf", "index", "bond", "fund", "other"}
+    if normalized_type is not None and normalized_type not in allowed_types:
+        raise ValueError("security_type must be one of: {}".format(
+            ", ".join(sorted(allowed_types))
+        ))
+    normalized_sort = str(sort or "symbol").strip().lower()
+    if normalized_sort not in INSTRUMENT_SORTS:
+        raise ValueError("sort must be one of: {}".format(
+            ", ".join(sorted(INSTRUMENT_SORTS))
+        ))
+    normalized_order = str(order or "asc").strip().lower()
+    if normalized_order not in {"asc", "desc"}:
+        raise ValueError("order must be asc or desc")
+    needle = str(search or "").strip().casefold()
+
+    filtered: List[Any] = []
+    for item in items:
+        item_exchange = str(getattr(getattr(item, "exchange", None), "value", getattr(item, "exchange", ""))).upper()
+        item_type = str(getattr(getattr(item, "security_type", None), "value", getattr(item, "security_type", ""))).lower()
+        item_active = bool(getattr(item, "active", True))
+        if normalized_exchange and item_exchange != normalized_exchange:
+            continue
+        if normalized_type and item_type != normalized_type:
+            continue
+        if active is not None and item_active is not bool(active):
+            continue
+        if needle:
+            metadata = getattr(item, "metadata", {}) or {}
+            searchable = [
+                getattr(item, "symbol", ""),
+                getattr(item, "name", ""),
+                item_exchange,
+                item_type,
+                metadata.get("industry", ""),
+                metadata.get("area", ""),
+                metadata.get("market", ""),
+                metadata.get("cnspell", ""),
+                metadata.get("fullname", ""),
+                metadata.get("enname", ""),
+            ]
+            if not any(needle in str(value or "").casefold() for value in searchable):
+                continue
+        filtered.append(item)
+
+    def sort_key(item: Any):
+        metadata = getattr(item, "metadata", {}) or {}
+        if normalized_sort == "name":
+            return str(getattr(item, "name", "")).casefold()
+        if normalized_sort == "exchange":
+            return str(getattr(getattr(item, "exchange", None), "value", getattr(item, "exchange", ""))).upper()
+        if normalized_sort == "security_type":
+            return str(getattr(getattr(item, "security_type", None), "value", getattr(item, "security_type", ""))).lower()
+        if normalized_sort == "listed_at":
+            listed_at = getattr(item, "listed_at", None)
+            return listed_at.isoformat() if listed_at is not None else ""
+        if normalized_sort == "industry":
+            return str(metadata.get("industry", "")).casefold()
+        if normalized_sort == "active":
+            return int(bool(getattr(item, "active", True)))
+        return str(getattr(item, "symbol", "")).upper()
+
+    filtered.sort(key=sort_key, reverse=normalized_order == "desc")
+    return filtered
 
 
 def _bar_projection_provenance(
@@ -1053,6 +1150,31 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/api/v1/instruments")
     async def instruments(
         symbols: Optional[str] = None,
+        search: Optional[str] = Query(
+            default=None,
+            max_length=100,
+            description="按证券代码、名称、行业、拼音或市场名称检索",
+        ),
+        exchange: Optional[str] = Query(
+            default=None,
+            description="交易所过滤：SH、SZ 或 BJ",
+        ),
+        security_type: Optional[str] = Query(
+            default=None,
+            description="证券类型：stock、etf、index、bond、fund 或 other",
+        ),
+        active: Optional[bool] = Query(
+            default=None,
+            description="是否只返回当前可交易/在市证券",
+        ),
+        active_only: Optional[bool] = Query(
+            default=None,
+            description="active 的兼容别名",
+        ),
+        limit: int = Query(default=5000, ge=1, le=5000),
+        offset: int = Query(default=0, ge=0),
+        sort: str = Query(default="symbol"),
+        order: str = Query(default="asc"),
         http_response: Response = None,
         refresh: bool = Query(
             default=False,
@@ -1078,19 +1200,69 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
         if items is None:
             raise MarketDataProviderError("provider returned no instrument catalogue")
+        # Keep catalogue coverage independent from the current symbol/search
+        # view. This lets clients distinguish one filtered match from the
+        # provider's complete security master without another request.
+        all_catalogue_items = list(items)
+        catalogue_total = len(all_catalogue_items)
+        catalogue_active_count = sum(
+            1 for item in all_catalogue_items if bool(getattr(item, "active", True))
+        )
         if requested is not None:
             items = [item for item in items if item.symbol in requested]
+        active_filter = active if active is not None else active_only
+        try:
+            items = _filter_instrument_catalogue(
+                items,
+                search=search,
+                exchange=exchange,
+                security_type=security_type,
+                active=active_filter,
+                sort=sort,
+                order=order,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        total = len(items)
+        page = items[offset : offset + limit]
+        realtime = getattr(runtime().provider, "realtime_status", {}) or {}
+        if not isinstance(realtime, Mapping):
+            realtime = {}
         if http_response is not None:
             mark_legacy_refresh_response(http_response, refresh)
         return {
-            "items": [jsonable(item) for item in items],
-            "count": len(items),
+            "items": [jsonable(item) for item in page],
+            "count": len(page),
+            "total": total,
+            "catalogue_total": catalogue_total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(page) < total,
             "provider": runtime().provider.name,
             "universe_scope": getattr(
                 runtime().provider, "universe_scope", "provider_catalogue"
             ),
             "served_from": "provider_refresh" if refresh else "sqlite_cache",
             "refresh_requested": refresh,
+            "as_of": realtime.get("last_catalogue_success_at"),
+            "catalogue": {
+                "source": runtime().provider.name,
+                "as_of": realtime.get("last_catalogue_success_at"),
+                "total": catalogue_total,
+                "active": catalogue_active_count,
+                "inactive": catalogue_total - catalogue_active_count,
+                "served_from": "provider_refresh" if refresh else "sqlite_cache",
+                "refresh_requested": refresh,
+            },
+            "filters": {
+                "symbols": sorted(requested) if requested is not None else None,
+                "search": search,
+                "exchange": str(exchange).upper() if exchange else None,
+                "security_type": str(security_type).lower() if security_type else None,
+                "active": active_filter,
+                "sort": str(sort).lower(),
+                "order": str(order).lower(),
+            },
         }
 
     def _parse_lineage_enum(value: Optional[str], enum_type, field: str):
