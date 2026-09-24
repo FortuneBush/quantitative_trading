@@ -5,6 +5,7 @@ const path = require('node:path');
 
 const treemap = require(path.join(__dirname, '../../quant_monitor/web/treemap.js'));
 const appSource = fs.readFileSync(path.join(__dirname, '../../quant_monitor/web/app.js'), 'utf8');
+const treemapSource = fs.readFileSync(path.join(__dirname, '../../quant_monitor/web/treemap.js'), 'utf8');
 
 function overlap(a, b) {
   const x = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
@@ -88,4 +89,26 @@ test('dashboard fetches and renders the cache-only treemap endpoint', () => {
   assert.match(appSource, /quantMonitorTreemap/);
   assert.match(appSource, /renderSectorTreemap/);
   assert.match(appSource, /页面不会为绘图单独请求上游接口/);
+});
+
+test('electronic-cloud contract exposes local live-update and sector-selection hooks', () => {
+  assert.match(appSource, /updateTreemapQuote/);
+  assert.match(appSource, /sectorTreemapLive/);
+  assert.match(appSource, /sqlite_cache\+local_websocket/);
+  assert.match(treemapSource, /onSelectSector/);
+  assert.match(treemapSource, /data-freshness/);
+  const normalized = treemap.normalizePayload({
+    visualization: 'electronic_cloud',
+    served_from: 'sqlite_cache',
+    universe_count: 2,
+    priced_count: 1,
+    sectors: [{
+      industry: '银行',
+      children: [{ symbol: '600000.SH', name: '甲银行', timestamp: '2026-09-18T15:00:00+08:00', freshness: 'fresh', change_pct: 1, amount: 10 }],
+    }],
+  });
+  assert.equal(normalized.servedFrom, 'sqlite_cache');
+  assert.equal(normalized.universeCount, 2);
+  assert.equal(normalized.pricedCount, 1);
+  assert.equal(normalized.sectors[0].items[0].freshness, 'fresh');
 });

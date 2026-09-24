@@ -67,6 +67,8 @@
     const amount = finiteNumber(first(source, ["amount", "turnover", "成交额"], null));
     const marketCap = finiteNumber(first(source, ["market_cap", "marketCap", "capitalization", "市值"], null));
     const sector = text(first(source, ["sector", "industry", "industry_name", "l1_name", "板块"], fallbackSector), fallbackSector);
+    const timestamp = first(source, ["timestamp", "updated_at", "time", "datetime", "ts"], null);
+    const freshness = text(first(source, ["freshness", "freshness_state", "quote_freshness"], timestamp ? "fresh" : "unknown"), timestamp ? "fresh" : "unknown");
     // Prefer market cap because it matches the market-map convention.  The
     // provider currently may only expose turnover, so fall back gracefully.
     const size = Math.max(0, finiteNumber(first(source, ["size", "weight"], null)) ?? marketCap ?? amount ?? 1);
@@ -79,6 +81,9 @@
       amount,
       marketCap,
       size: size > 0 ? size : 1,
+      sizeBasis: text(first(source, ["size_basis", "size_semantics"], ""), ""),
+      timestamp,
+      freshness,
     };
   }
 
@@ -123,11 +128,17 @@
         : null;
       return { id: name, name, size: weight, changePct: weightedChange, amount: totalAmount || null, items };
     }).filter((sector) => sector.items.length).sort((a, b) => b.size - a.size || a.name.localeCompare(b.name));
+    const universeCount = finiteNumber(first(object, ["universe_count", "universe_total", "catalogue_total"], null));
+    const pricedCount = finiteNumber(first(object, ["priced_count", "visible_stock_count", "quote_count"], null));
     return {
       asOf: first(object, ["as_of", "updated_at", "timestamp"], null),
       source: text(first(object, ["source", "provider", "served_from"], "本地缓存"), "本地缓存"),
+      servedFrom: text(first(object, ["served_from"], "sqlite_cache"), "sqlite_cache"),
       marketStatus: first(object, ["market_status", "market", "session"], null),
       summary: objectFrom(first(object, ["summary", "breadth"], {})),
+      universeCount,
+      pricedCount,
+      upstreamRequests: finiteNumber(first(object, ["upstream_requests", "provider_operations"], 0)) ?? 0,
       sectors,
       total: sectors.reduce((sum, sector) => sum + sector.items.length, 0),
     };
@@ -231,29 +242,48 @@
     svg.append(background);
     const sectorRects = layoutTreemap(normalized.sectors, width, height);
     const onSelect = options && typeof options.onSelect === "function" ? options.onSelect : null;
+    const onSelectSector = options && typeof options.onSelectSector === "function" ? options.onSelectSector : null;
     sectorRects.forEach(({ node: sector, x, y, width: sectorWidth, height: sectorHeight }) => {
       const group = createSvgElement("g", { class: "sector-treemap-sector" });
+      group.setAttribute("data-sector", sector.name);
       const outer = createSvgElement("rect", { x: x + 1, y: y + 1, width: Math.max(0, sectorWidth - 2), height: Math.max(0, sectorHeight - 2), rx: 3, fill: colorForChange(sector.changePct, 0.2), stroke: "rgba(9, 17, 26, .95)", "stroke-width": 2 });
       group.append(outer);
       const headerHeight = sectorHeight >= 48 ? 22 : 0;
       if (headerHeight) {
         const header = createSvgElement("rect", { x: x + 1, y: y + 1, width: Math.max(0, sectorWidth - 2), height: headerHeight, fill: "rgba(3, 10, 16, .72)" });
+        header.setAttribute("class", "sector-treemap-sector-header");
         group.append(header);
         if (sectorWidth >= 68) {
           const label = createSvgElement("text", { x: x + 7, y: y + 15, fill: "#d7e5ee", "font-size": sectorWidth >= 130 ? 12 : 10, "font-weight": 650 });
           label.textContent = `${sector.name}  ${changeLabel(sector.changePct)}`;
           group.append(label);
         }
+        const sectorTitle = createSvgElement("title", {});
+        sectorTitle.textContent = `${sector.name} · ${changeLabel(sector.changePct)} · 上涨 ${sector.advancers ?? "—"} · 下跌 ${sector.decliners ?? "—"} · ${sector.items.length} 只`;
+        header.append(sectorTitle);
+        if (onSelectSector) {
+          header.setAttribute("class", "sector-treemap-sector-header sector-treemap-sector-clickable");
+          header.setAttribute("tabindex", "0");
+          header.setAttribute("role", "button");
+          header.setAttribute("aria-label", `查看${sector.name}板块，${changeLabel(sector.changePct)}`);
+          header.addEventListener("click", () => onSelectSector(sector.name, sector));
+          header.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              onSelectSector(sector.name, sector);
+            }
+          });
+        }
       }
       const inner = layoutTreemap(sector.items, Math.max(0, sectorWidth - 4), Math.max(0, sectorHeight - headerHeight - 4));
       inner.forEach(({ node: item, x: itemX, y: itemY, width: itemWidth, height: itemHeight }) => {
         const px = x + 2 + itemX;
         const py = y + headerHeight + 2 + itemY;
-        const cell = createSvgElement("g", { class: "sector-treemap-item", tabindex: "0", role: "button", "aria-label": `${item.name} ${item.symbol} ${changeLabel(item.changePct)}` });
+        const cell = createSvgElement("g", { class: "sector-treemap-item", tabindex: "0", role: "button", "data-symbol": item.symbol, "data-freshness": item.freshness, "aria-label": `${item.name} ${item.symbol} ${changeLabel(item.changePct)}，${item.freshness === "fresh" ? "行情新鲜" : "行情时间待核验"}` });
         const rect = createSvgElement("rect", { x: px, y: py, width: Math.max(0, itemWidth - 1), height: Math.max(0, itemHeight - 1), rx: 2, fill: colorForChange(item.changePct, 0.88), stroke: "rgba(8, 17, 25, .75)", "stroke-width": 1 });
         cell.append(rect);
         const title = createSvgElement("title", {});
-        title.textContent = `${item.name} (${item.symbol}) · ${changeLabel(item.changePct)}${item.price === null ? "" : ` · ${item.price}`}`;
+        title.textContent = `${item.name} (${item.symbol}) · ${changeLabel(item.changePct)}${item.price === null ? "" : ` · ${item.price}`} · ${item.freshness === "fresh" ? "行情新鲜" : "行情时间待核验"}`;
         cell.append(title);
         if (itemWidth >= 52 && itemHeight >= 25) {
           const name = createSvgElement("text", { x: px + itemWidth / 2, y: py + Math.min(itemHeight / 2 - 1, 17), fill: "#f1f6f8", "font-size": itemWidth >= 110 ? 12 : 9, "font-weight": 600, "text-anchor": "middle", "pointer-events": "none" });

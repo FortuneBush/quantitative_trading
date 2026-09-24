@@ -75,8 +75,14 @@ def test_treemap_alias_and_bounded_query_parameters(treemap_client):
         "/api/v1/sectors/treemap",
         params={"max_industries": 1, "max_stocks_per_industry": 1},
     )
-    assert primary.status_code == alias.status_code == 200
+    cloud = treemap_client.get(
+        "/api/v1/market/electronic-cloud",
+        params={"max_industries": 1, "max_stocks_per_industry": 1},
+    )
+    assert primary.status_code == alias.status_code == cloud.status_code == 200
     assert alias.json() == primary.json()
+    assert cloud.json() == primary.json()
+    assert primary.json()["visualization"] == "electronic_cloud"
     assert primary.json()["count"] <= 1
     assert all(len(group["children"]) <= 1 for group in primary.json()["items"])
 
@@ -84,6 +90,24 @@ def test_treemap_alias_and_bounded_query_parameters(treemap_client):
         "/api/v1/market/treemap", params={"max_industries": 2001}
     )
     assert too_large.status_code == 422
+
+
+def test_electronic_cloud_alias_is_cache_only(treemap_client):
+    runtime = treemap_client.app.state.runtime
+
+    async def fail_fetch(*args, **kwargs):
+        raise AssertionError("electronic cloud must not perform provider I/O")
+
+    runtime.provider.fetch_quotes = fail_fetch
+    response = treemap_client.get("/api/v1/market/electronic-cloud")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["visualization"] == "electronic_cloud"
+    assert body["data_version"] == "market-treemap-v2"
+    assert body["upstream_requests"] == 0
+    assert body["served_from"] == "sqlite_cache"
+    assert body["freshness"]["state"] in {"fresh", "stale", "missing", "unknown"}
+    assert body["freshness"]["source"] == "latest_persisted_quote"
 
 
 def test_treemap_preserves_empty_cache_as_a_valid_response(treemap_client):

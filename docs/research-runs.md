@@ -370,3 +370,10 @@ print(manifest.to_json())
 `BacktestConfig` 的可初始化字段，未知字段令 `execution_configuration_supported=false`，
 不会被静默忽略后改用默认值。任一绑定检查失败时不执行重放，`replayed_result_hash`
 保持 `null`，治理报告也不会授予可复现状态。上述检查没有网络或数据库副作用。
+
+回测配置还支持两项可选的成交约束：`require_explicit_tradeability=true` 会在缺少同一
+证券/会话的点时点交易状态时跳过成交；`max_volume_participation_rate`（0 到 1 的
+Decimal）会按执行日线成交量限制参与率，并按交易单位向下取整。部分成交会保留未成交持仓
+或现金，并写入 `volume_participation_capped` / `volume_capacity_too_low` 跳过记录及诊断
+假设。默认值保持历史探索性行为；研究运行应显式启用这些字段，不能把日线成交量当成无限
+可成交流动性。

@@ -185,8 +185,22 @@ button:focus-visible, [tabindex]:focus-visible, tr[tabindex]:focus-visible {
 .sector-treemap-item { cursor: pointer; outline: none; }
 .sector-treemap-item:hover rect, .sector-treemap-item:focus rect { stroke: var(--accent); stroke-width: 2; filter: brightness(1.14); }
 .sector-treemap-item:focus { outline: none; }
+.sector-treemap-item[data-freshness="stale"] rect,
+.sector-treemap-item[data-freshness="future_timestamp"] rect,
+.sector-treemap-item[data-freshness="unknown"] rect { stroke: rgba(246, 190, 71, .72); stroke-dasharray: 3 2; }
+.sector-treemap-sector-header { cursor: default; }
+.sector-treemap-sector-header.sector-treemap-sector-clickable { cursor: pointer; }
+.sector-treemap-sector-header.sector-treemap-sector-clickable:hover,
+.sector-treemap-sector-header.sector-treemap-sector-clickable:focus { filter: brightness(1.3); outline: none; }
 .sector-treemap-empty { display: grid; place-items: center; min-height: 520px; padding: 24px; color: var(--muted); text-align: center; font-size: 12px; }
 .sector-treemap-panel > .panel-note { margin: 8px 16px 13px; }
+.sector-treemap-legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 9px 16px 0; color: var(--muted); font-size: 11px; }
+.sector-treemap-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+.cloud-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; border: 1px solid rgba(255,255,255,.18); }
+.cloud-swatch.up { background: rgba(238, 73, 85, .88); }
+.cloud-swatch.flat { background: rgba(76, 91, 108, .88); }
+.cloud-swatch.down { background: rgba(36, 150, 118, .88); }
+.cloud-legend-hint { margin-left: auto; }
 
 .hero-row { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 18px; }
 

@@ -21,7 +21,15 @@ from quant_monitor.data_sources import (
     AllTickMarketDataProvider,
     MockMarketDataProvider,
 )
-from quant_monitor.domain import EventType, MarketEvent, Quote, now_market_time
+from quant_monitor.domain import (
+    EventType,
+    Exchange,
+    Instrument,
+    MarketEvent,
+    Quote,
+    SecurityType,
+    now_market_time,
+)
 from quant_monitor.market import market_status
 from quant_monitor.trading_calendar import DEFAULT_TRADING_CALENDAR, TradingCalendar
 from quant_monitor.serialization import alert_dict, jsonable, quote_dict, signal_dict
@@ -245,10 +253,15 @@ class ApplicationRuntime:
                 instrument_names=STOCK_NAMES,
                 base_url=settings.asharehub_base_url,
                 request_timeout_seconds=settings.asharehub_request_timeout_seconds,
-                quote_cache_seconds=settings.asharehub_quote_cache_seconds,
+                quote_cache_seconds=(
+                    settings.asharehub_market_quote_cache_seconds
+                    if settings.universe_mode == "market"
+                    else settings.asharehub_quote_cache_seconds
+                ),
                 bars_cache_seconds=settings.asharehub_bars_cache_seconds,
                 instruments_cache_seconds=settings.asharehub_instruments_cache_seconds,
                 daily_soft_limit=settings.asharehub_daily_soft_limit,
+                official_daily_limit=settings.asharehub_official_daily_limit,
                 budget_path=budget_path,
                 retries=settings.asharehub_retries,
                 retry_backoff_seconds=settings.asharehub_retry_backoff_seconds,
@@ -427,12 +440,25 @@ class ApplicationRuntime:
             if str(item.metadata.get("source") or "") == self.provider.name
         ]
 
+    def _research_symbols(self) -> Tuple[str, ...]:
+        """Return the bounded historical/strategy universe.
+
+        Market mode expands only the realtime quote basket.  Daily history
+        remains an explicit research scope (the configured watchlist) so a
+        full-market snapshot cannot silently turn into thousands of daily
+        requests or an unbounded strategy evaluation.
+        """
+
+        if self.settings.universe_mode == "market":
+            return tuple(self.settings.watchlist)
+        return tuple(self.symbols)
+
     def _cached_bars_for_startup(self):
         """Read the bounded startup bar cache in one worker-thread operation."""
 
         cached_bars = []
         intervals = tuple(dict.fromkeys((self.settings.bar_interval, "1d")))
-        for symbol in self.symbols:
+        for symbol in self._research_symbols():
             for interval in intervals:
                 limit = (
                     self.settings.history_bar_count
@@ -557,15 +583,64 @@ class ApplicationRuntime:
         return STOCK_NAMES.get(symbol, symbol)
 
     def _configure_research_universe_from_cache(self) -> None:
-        """Resolve the bank universe without network I/O during ASGI startup."""
+        """Resolve the quote and bounded research universes from local cache."""
 
-        if self.settings.universe_mode != "bank":
-            return
         catalogue = [
             item
             for item in self.repository.list_instruments(active_only=False)
             if str(item.metadata.get("source") or "") == self.provider.name
         ]
+        if self.settings.universe_mode == "market":
+            selected = tuple(
+                sorted(
+                    (
+                        item
+                        for item in catalogue
+                        if item.active
+                        and item.security_type.value == "stock"
+                        and item.exchange.value in {"SH", "SZ", "BJ"}
+                    ),
+                    key=lambda item: item.symbol,
+                )
+            )
+            # A market basket is only authoritative when it came from a
+            # complete provider catalogue.  A partial cache must remain
+            # visible as a watchlist fallback rather than being presented as
+            # full-market coverage.
+            if len(catalogue) < MINIMUM_AUTHORITATIVE_STOCK_CATALOGUE or not selected:
+                selected = tuple(
+                    item
+                    for item in self.repository.list_instruments(active_only=False)
+                    if item.symbol in self.settings.watchlist
+                ) or tuple(
+                    Instrument(
+                        symbol=symbol,
+                        name=STOCK_NAMES.get(symbol, symbol),
+                        exchange=Exchange(symbol.rsplit(".", 1)[1]),
+                        security_type=SecurityType.STOCK,
+                        active=True,
+                        metadata={"source": "configured_watchlist"},
+                    )
+                    for symbol in self.settings.watchlist
+                )
+                self.universe_source = "configured_watchlist_fallback"
+            else:
+                self.universe_source = "asharehub_market_catalogue"
+            self.symbols = tuple(item.symbol for item in selected)
+            provider_configure = getattr(self.provider, "configure_symbols", None)
+            if provider_configure is not None:
+                try:
+                    provider_configure(
+                        self.symbols,
+                        allow_batched=self.provider.name == "asharehub",
+                    )
+                except TypeError:
+                    provider_configure(self.symbols)
+            self.monitor.configure_symbols(self.symbols)
+            self._refresh_strategy_profile()
+            return
+        if self.settings.universe_mode != "bank":
+            return
         dynamic_banks = tuple(
             sorted(
                 (item for item in catalogue if is_active_bank_stock(item)),
@@ -594,7 +669,13 @@ class ApplicationRuntime:
             self.repository.upsert_instruments(fallback_bank_instruments())
         provider_configure = getattr(self.provider, "configure_symbols", None)
         if provider_configure is not None:
-            provider_configure(self.symbols)
+            try:
+                provider_configure(
+                    self.symbols,
+                    allow_batched=self.settings.universe_mode == "market",
+                )
+            except TypeError:
+                provider_configure(self.symbols)
         self.monitor.configure_symbols(self.symbols)
         self._refresh_strategy_profile()
 
@@ -694,7 +775,7 @@ class ApplicationRuntime:
         ready: Set[str] = set()
         freshness_check = getattr(self.provider, "has_current_bar_data", None)
         if freshness_check is not None:
-            for symbol in self.symbols:
+            for symbol in self._research_symbols():
                 if freshness_check(
                     symbol,
                     interval=self.settings.bar_interval,
@@ -702,7 +783,7 @@ class ApplicationRuntime:
                 ):
                     ready.add(symbol)
             return ready
-        for symbol in self.symbols:
+        for symbol in self._research_symbols():
             enough_rows = len(
                 self.repository.get_bars(
                     symbol,
@@ -723,7 +804,7 @@ class ApplicationRuntime:
         bars = []
         metrics = []
         signature = []
-        for symbol in self.symbols:
+        for symbol in self._research_symbols():
             symbol_bars = self.repository.get_bars(
                 symbol,
                 interval=self.settings.bar_interval,
@@ -740,7 +821,7 @@ class ApplicationRuntime:
                 )
             )
         quotes = self.repository.get_latest_quotes(
-            self.symbols,
+            self._research_symbols(),
             source_prefix=self.provider.name,
         )
         return (
@@ -793,7 +874,9 @@ class ApplicationRuntime:
                 # 240 rows; later sessions will grow its cache incrementally.
                 ready_before = self._history_ready_symbols()
                 pending = [
-                    symbol for symbol in self.symbols if symbol not in ready_before
+                    symbol
+                    for symbol in self._research_symbols()
+                    if symbol not in ready_before
                 ]
                 self._history_bootstrap_deferred = False
                 for symbol in pending:
@@ -956,6 +1039,39 @@ class ApplicationRuntime:
                 seed_instruments = getattr(self.provider, "seed_instruments", None)
                 if seed_instruments is not None:
                     seed_instruments(cached_instruments)
+                if (
+                    self.settings.universe_mode == "market"
+                    and len(cached_instruments) < MINIMUM_AUTHORITATIVE_STOCK_CATALOGUE
+                ):
+                    # Market mode explicitly opts into one startup reference
+                    # request when the local catalogue is incomplete.  The
+                    # resulting catalogue is persisted before the quote
+                    # monitor starts, so every subsequent cycle can build a
+                    # deterministic, batched market basket without repeating
+                    # this request.
+                    try:
+                        refreshed = await self.provider.fetch_instruments()
+                        if len(refreshed) >= MINIMUM_AUTHORITATIVE_STOCK_CATALOGUE:
+                            await asyncio.to_thread(
+                                self.repository.replace_instruments, refreshed
+                            )
+                            cached_instruments = list(refreshed)
+                            if seed_instruments is not None:
+                                seed_instruments(cached_instruments)
+                            LOGGER.info(
+                                "market catalogue loaded during startup: %s instruments",
+                                len(cached_instruments),
+                            )
+                        else:
+                            LOGGER.warning(
+                                "market catalogue is incomplete: %s instruments",
+                                len(refreshed),
+                            )
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "market catalogue startup refresh unavailable: %s",
+                            type(exc).__name__,
+                        )
             await asyncio.to_thread(self._configure_research_universe_from_cache)
             seed_quotes = getattr(self.provider, "seed_quotes", None)
             cached_quotes = []
@@ -976,7 +1092,7 @@ class ApplicationRuntime:
             # background job.  The normal monitor starts quote-only so the two
             # jobs cannot duplicate daily requests during application startup.
             if self.provider.name == "asharehub":
-                self._history_bootstrap_total = len(self.symbols)
+                self._history_bootstrap_total = len(self._research_symbols())
                 self._history_bootstrap_ready = len(self._history_ready_symbols())
                 self._history_bootstrap_state = "scheduled"
                 self.monitor.collector.collect_bars_enabled = False
@@ -1286,7 +1402,10 @@ class ApplicationRuntime:
                     or self.settings.asharehub_daily_soft_limit
                 )
                 provider_status["quota"] = {
-                    "limit": 100,
+                    "limit": int(
+                        realtime.get("official_daily_limit")
+                        or self.settings.asharehub_official_daily_limit
+                    ),
                     "soft_limit": soft_limit,
                     "used": used,
                     "remaining_soft": max(
@@ -1546,6 +1665,14 @@ class ApplicationRuntime:
                 "industry": self.settings.universe_industry,
                 "source": self.universe_source,
                 "symbols": len(self.symbols),
+                "quote_batch_size": realtime.get("subscription_limit"),
+                "quote_batch_count": realtime.get("batch_count"),
+                "quote_batched": bool(realtime.get("batched_quotes", False)),
+                "quote_coverage_ratio": round(
+                    received_count / len(self.symbols), 6
+                )
+                if self.symbols
+                else None,
             },
             "websocket_clients": self.hub.count,
             "market": market,
@@ -1555,11 +1682,19 @@ class ApplicationRuntime:
 
     def data_notice(self) -> str:
         if self.provider.name == "asharehub":
+            if self.settings.universe_mode == "market":
+                return (
+                    "当前使用 AShareHub 全市场股票目录：沪深北 active stock 按每批最多 200 只分批获取"
+                    " HTTP 实时快照，目录与行情覆盖率在系统状态中单独披露。上游没有官方 WebSocket、"
+                    "五档盘口或分钟 K 线；本地 WebSocket 仅推送轮询后的增量。全市场模式使用较长报价缓存"
+                    "以控制每日额度，停牌/无成交证券可能在覆盖率中缺失。平台只产生研究信号，不执行交易。"
+                )
             return (
                 "当前使用 AShareHub 覆盖沪深银行板块：批量行情快照与未复权日线。上游没有官方 WebSocket、"
                 "五档盘口或分钟 K 线；页面 WebSocket 仅推送本地轮询后的增量。非交易时段可能"
-                "显示上一交易日收盘快照。本机按上海自然日执行 90 次软预算，平台官方免费额度为"
-                "每日 100 次，剩余额度为本地估算。银行股排名只读 SQLite；多因子结果仅为研究信号。"
+                "显示上一交易日收盘快照。本机按上海自然日执行配置的软预算，套餐上限由"
+                "asharehub_official_daily_limit 披露，剩余额度为本地估算。银行股排名只读 SQLite；"
+                "多因子结果仅为研究信号。"
             )
         if self.provider.name == "alltick":
             return (

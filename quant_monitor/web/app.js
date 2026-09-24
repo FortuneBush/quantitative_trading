@@ -54,6 +54,7 @@ function quantMonitorFreshnessSummary(states) {
     marketQuotes: [],
     marketSummary: null,
     sectorTreemapPayload: null,
+    treemapRenderTimer: null,
     analysis: null,
     selectedSymbol: null,
     period: "1d",
@@ -94,6 +95,8 @@ function quantMonitorFreshnessSummary(states) {
     sectorTreemap: el("sector-treemap"),
     sectorTreemapSource: el("sector-treemap-source"),
     sectorTreemapAsOf: el("sector-treemap-asof"),
+    sectorTreemapLive: el("sector-treemap-live"),
+    sectorTreemapCoverage: el("sector-treemap-coverage"),
     sectorTreemapNote: el("sector-treemap-note"),
     bankQuotaBadge: el("bank-quota-badge"),
     analysisName: el("analysis-name"),
@@ -1167,9 +1170,80 @@ function quantMonitorFreshnessSummary(states) {
     });
   }
 
+  // The treemap is initially built from the cache-only HTTP snapshot.  Local
+  // WebSocket quote events can then update an existing tile in place, without
+  // requesting the provider again.  This keeps the cloud responsive when the
+  // collector is running while preserving the provider's daily request budget.
+  function scheduleTreemapRender() {
+    if (!state.sectorTreemapPayload || !dom.sectorTreemap) return;
+    window.clearTimeout(state.treemapRenderTimer);
+    state.treemapRenderTimer = window.setTimeout(() => {
+      state.treemapRenderTimer = null;
+      renderSectorTreemap(state.sectorTreemapPayload);
+    }, 120);
+  }
+
+  function updateTreemapQuote(raw) {
+    const incoming = normalizeQuote(raw);
+    const payload = state.sectorTreemapPayload;
+    if (!incoming.symbol || !payload) return false;
+    const object = objectFrom(payload);
+    const groups = listFrom(object, ["sectors", "industries", "groups", "items"]);
+    const arrays = [];
+    const seen = new Set();
+    const addArray = (rows) => {
+      if (!Array.isArray(rows) || seen.has(rows)) return;
+      seen.add(rows);
+      arrays.push(rows);
+    };
+    groups.forEach((group) => {
+      if (!group || typeof group !== "object") return;
+      ["children", "items", "stocks", "quotes", "members"].forEach((key) => addArray(group[key]));
+    });
+    ["stocks", "quotes", "records"].forEach((key) => addArray(object[key]));
+    let touched = false;
+    arrays.forEach((rows) => rows.forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const symbol = String(firstDefined(item, ["symbol", "code", "ticker"], ""));
+      if (symbol !== incoming.symbol) return;
+      touched = true;
+      if (incoming.price !== null) {
+        item.price = incoming.price;
+        item.last = incoming.price;
+      }
+      if (incoming.preClose !== null) item.previous_close = incoming.preClose;
+      if (incoming.changePct !== null) {
+        item.change_pct = incoming.changePct;
+        item.pct_change = incoming.changePct;
+      }
+      if (incoming.amount !== null) {
+        item.amount = incoming.amount;
+        item.turnover = incoming.amount;
+        if (String(firstDefined(item, ["size_basis"], "")).includes("turnover")) {
+          item.size = incoming.amount > 0 ? incoming.amount : 1;
+          item.value = item.size;
+        }
+      }
+      if (incoming.updatedAt) {
+        item.timestamp = incoming.updatedAt;
+        payload.as_of = incoming.updatedAt;
+        payload.updated_at = incoming.updatedAt;
+      }
+      item.freshness = incoming.freshness || (incoming.updatedAt ? "fresh" : item.freshness || "unknown");
+      item.quote_status = "available";
+    }));
+    if (touched) {
+      payload.live_update_at = incoming.updatedAt || new Date().toISOString();
+      payload.served_from = "sqlite_cache+local_websocket";
+      scheduleTreemapRender();
+    }
+    return touched;
+  }
+
   function updateQuote(raw) {
     const incoming = normalizeQuote(raw);
     if (!incoming.symbol) return;
+    updateTreemapQuote(raw);
     const index = state.watchlist.findIndex((item) => item.symbol === incoming.symbol);
     if (index < 0) return;
     const previous = state.watchlist[index];
@@ -2136,19 +2210,51 @@ function quantMonitorFreshnessSummary(states) {
     const universeCount = finiteNumber(firstDefined(payload, ["universe_count", "universe_total"], null));
     const pricedCount = finiteNumber(firstDefined(payload, ["priced_count", "visible_stock_count"], normalized.total));
     const partial = universeCount !== null && pricedCount !== null && pricedCount < universeCount;
+    const servedFrom = String(firstDefined(payload, ["served_from"], normalized.servedFrom || "sqlite_cache"));
+    const liveUpdateAt = toDate(firstDefined(payload, ["live_update_at"], null));
+    const liveAge = liveUpdateAt ? (Date.now() - liveUpdateAt.getTime()) / 1000 : Infinity;
+    const live = liveAge >= 0 && liveAge <= Math.max(15, POLL_INTERVAL / 1000 * 2);
+    const freshness = objectFrom(firstDefined(payload, ["freshness"], {}));
+    const freshnessState = String(firstDefined(freshness, ["state"], "unknown")).toLowerCase();
+    const staleSnapshot = ["stale", "future_timestamp"].includes(freshnessState);
     setPill(
       dom.sectorTreemapSource,
       sectors.length ? String(source) : "等待行业行情",
       sectors.length ? (partial ? "warning" : "ok") : "neutral",
     );
+    if (dom.sectorTreemapLive) {
+      const label = live
+        ? "本地推送实时"
+        : staleSnapshot
+          ? "缓存已过期"
+          : servedFrom.includes("sqlite") ? "SQLite 缓存" : "等待行情";
+      setPill(dom.sectorTreemapLive, label, live ? "ok" : staleSnapshot ? "bad" : sectors.length ? "warning" : "neutral");
+      dom.sectorTreemapLive.title = live
+        ? `最近一条本地 WebSocket 行情：${formatTime(liveUpdateAt, true)}`
+        : staleSnapshot
+          ? `最新落盘行情已超过新鲜度阈值：${formatTime(firstDefined(freshness, ["as_of"], null), true)}`
+          : "电子云图不会因页面刷新直接请求上游；数据来自本地行情缓存";
+    }
+    if (dom.sectorTreemapCoverage) {
+      const coverageText = universeCount === null
+        ? `${normalized.total || 0} 只已报价`
+        : `行情 ${pricedCount ?? 0} / 目录 ${universeCount}`;
+      dom.sectorTreemapCoverage.textContent = coverageText;
+      dom.sectorTreemapCoverage.className = `count-badge ${partial ? "warning" : ""}`;
+    }
     const asOf = firstDefined(payload, ["as_of", "updated_at", "timestamp"], normalized?.asOf);
     if (dom.sectorTreemapAsOf) dom.sectorTreemapAsOf.textContent = asOf ? `数据时间 ${formatTime(asOf, true)}` : "数据时间 —";
     if (dom.sectorTreemapNote) {
       const sizeSemantics = String(firstDefined(payload, ["size_semantics"], "turnover_preferred") || "turnover_preferred");
       const sizeText = sizeSemantics.includes("turnover") ? "成交额" : sizeSemantics.includes("market_cap") ? "市值" : sizeSemantics.includes("volume_times_price") ? "成交量×价格" : "可用规模";
       const scaleNote = sizeSemantics.includes("market_cap") ? "" : "，不等同于市值";
+      const streamNote = live
+        ? "本地 WebSocket 行情会更新已显示图块"
+        : staleSnapshot
+          ? "最新缓存已过期，等待新的本地行情"
+          : "当前按 SQLite 缓存快照显示，等待本地行情推送";
       dom.sectorTreemapNote.textContent = sectors.length
-        ? `已展示 ${sectors.length} 个行业、${normalized.total || 0} 只个股${universeCount !== null ? `（目录 ${universeCount}，已收到报价 ${pricedCount ?? 0}）` : ""}；面积优先按${sizeText}（缺失时按可用规模${scaleNote}），颜色按涨跌幅。点击个股可查看下方分析。`
+        ? `已展示 ${sectors.length} 个行业、${normalized.total || 0} 只个股${universeCount !== null ? `（目录 ${universeCount}，已收到报价 ${pricedCount ?? 0}）` : ""}；面积优先按${sizeText}（缺失时按可用规模${scaleNote}），颜色按涨跌幅。${streamNote}；点击个股可查看下方分析。`
         : "当前没有行业分类或个股行情缓存；页面不会为绘图单独请求上游接口。";
     }
   }
@@ -2378,6 +2484,7 @@ function quantMonitorFreshnessSummary(states) {
       }
       const watchlistPayload = firstDefined(snapshot, ["watchlist", "quotes"], []);
       const quotes = listFrom(watchlistPayload, ["items", "quotes", "watchlist"]);
+      quotes.forEach((quote) => updateTreemapQuote(quote));
       if (!state.bankMode) {
         state.watchlist = quotes.map(normalizeQuote).filter((item) => item.symbol);
         renderWatchlist();

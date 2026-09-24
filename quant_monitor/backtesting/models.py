@@ -105,6 +105,12 @@ class BacktestConfig:
     daily_execution_time: time = time(9, 30)
     default_signal_valid_sessions: int = 1
     maximum_signal_valid_sessions: int = 20
+    # Optional strict execution controls.  Exploratory backtests retain the
+    # historical permissive defaults; research callers can fail closed when a
+    # point-in-time tradeability snapshot is absent and bound fills to a
+    # configurable fraction of the execution bar volume.
+    require_explicit_tradeability: bool = False
+    max_volume_participation_rate: Optional[Decimal] = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -167,6 +173,17 @@ class BacktestConfig:
             raise ValueError(
                 "default_signal_valid_sessions cannot exceed maximum_signal_valid_sessions"
             )
+        if not isinstance(self.require_explicit_tradeability, bool):
+            raise TypeError("require_explicit_tradeability must be a boolean")
+        if self.max_volume_participation_rate is not None:
+            participation = _decimal(
+                self.max_volume_participation_rate,
+                "max_volume_participation_rate",
+                positive=True,
+            )
+            if participation > 1:
+                raise ValueError("max_volume_participation_rate must not exceed 1")
+            object.__setattr__(self, "max_volume_participation_rate", participation)
         object.__setattr__(self, "lot_size", lot_size)
         object.__setattr__(self, "annualization_sessions", annualization_sessions)
         object.__setattr__(self, "interval", interval)

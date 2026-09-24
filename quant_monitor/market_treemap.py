@@ -92,6 +92,46 @@ def _timestamp(value: Any) -> Optional[str]:
     return value.isoformat() if isinstance(value, datetime) else None
 
 
+def _median(values: Sequence[float]) -> Optional[float]:
+    """Return a deterministic median for a non-empty numeric sequence."""
+
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return round(ordered[middle], 6)
+    return round((ordered[middle - 1] + ordered[middle]) / 2.0, 6)
+
+
+def _breadth(items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Summarize priced tiles without turning missing changes into zeroes."""
+
+    known = [
+        float(item["pct_change"])
+        for item in items
+        if item.get("pct_change") is not None
+    ]
+    advancers = sum(1 for value in known if value > 0)
+    decliners = sum(1 for value in known if value < 0)
+    unchanged = sum(1 for value in known if value == 0)
+    return {
+        "count": len(items),
+        "known_change_count": len(known),
+        "missing_change_count": max(0, len(items) - len(known)),
+        "advancers": advancers,
+        "decliners": decliners,
+        "unchanged": unchanged,
+        "average_pct_change": round(sum(known) / len(known), 6) if known else None,
+        "median_pct_change": _median(known),
+        "change_coverage": round(len(known) / len(items), 6) if items else 0.0,
+        "total_volume": sum(int(item.get("volume") or 0) for item in items),
+        "total_turnover": str(
+            sum((_decimal(item.get("turnover")) or Decimal("0") for item in items), Decimal("0"))
+        ),
+    }
+
+
 def _stock_tile(
     quote: Quote,
     instrument: Optional[Instrument],
@@ -121,7 +161,9 @@ def _stock_tile(
         # Keep the common quote naming available to generic dashboard
         # components while retaining the explicit turnover semantics above.
         "amount": str(quote.turnover),
+        "change": pct,
         "timestamp": _timestamp(quote.timestamp),
+        "quote_timestamp": _timestamp(quote.timestamp),
         "source": quote.source,
         "quote_status": "available",
     }
@@ -193,6 +235,7 @@ def build_market_treemap(
             change = round(float(weighted), 6)
         else:
             change = None
+        breadth = _breadth(visible)
         industries.append(
             {
                 "id": "industry:" + industry,
@@ -213,7 +256,29 @@ def build_market_treemap(
                     )
                 ),
                 "priced_count": len(visible),
+                "stock_count": len(visible),
                 "omitted_count": len(omitted),
+                "breadth": breadth,
+                "average_pct_change": breadth["average_pct_change"],
+                "median_pct_change": breadth["median_pct_change"],
+                "total_volume": breadth["total_volume"],
+                "total_turnover": breadth["total_turnover"],
+                "top_gainers": sorted(
+                    (
+                        item
+                        for item in visible
+                        if item.get("pct_change") is not None and item["pct_change"] > 0
+                    ),
+                    key=lambda item: (-float(item["pct_change"]), item["symbol"]),
+                )[:3],
+                "top_decliners": sorted(
+                    (
+                        item
+                        for item in visible
+                        if item.get("pct_change") is not None and item["pct_change"] < 0
+                    ),
+                    key=lambda item: (float(item["pct_change"]), item["symbol"]),
+                )[:3],
                 "children": visible,
                 # ``items`` is a compact alias used by lightweight treemap
                 # clients that do not implement a generic hierarchy schema.
@@ -229,7 +294,7 @@ def build_market_treemap(
     timestamps = [quote.timestamp for quote in latest.values()]
     as_of = max(timestamps).isoformat() if timestamps else None
     visible_items = [item for group in industries for item in group["children"]]
-    known_pct = [item["pct_change"] for item in visible_items if item["pct_change"] is not None]
+    breadth = _breadth(visible_items)
     return {
         "items": industries,
         "sectors": industries,
@@ -238,20 +303,23 @@ def build_market_treemap(
         "priced_count": priced_symbols,
         "visible_stock_count": visible_symbols,
         "unpriced_count": max(0, all_symbols - priced_symbols),
+        "coverage": {
+            "catalogue_count": all_symbols,
+            "priced_count": priced_symbols,
+            "unpriced_count": max(0, all_symbols - priced_symbols),
+            "quote_coverage": round(priced_symbols / all_symbols, 6) if all_symbols else 0.0,
+            "visible_stock_count": visible_symbols,
+        },
         "omitted_industry_count": len(omitted_industries),
         "as_of": as_of,
         "summary": {
             "count": len(visible_items),
-            "advancers": sum(1 for item in visible_items if (item["pct_change"] or 0) > 0),
-            "decliners": sum(1 for item in visible_items if (item["pct_change"] or 0) < 0),
-            "unchanged": sum(1 for item in visible_items if item["pct_change"] == 0),
-            "average_pct_change": (
-                round(sum(known_pct) / len(known_pct), 6) if known_pct else None
-            ),
-            "total_turnover": str(
-                sum((Decimal(str(item.get("turnover") or "0")) for item in visible_items), Decimal("0"))
-            ),
+            **breadth,
         },
+        "breadth": breadth,
+        "visualization": "electronic_cloud",
+        "data_version": "market-treemap-v2",
+        "update_semantics": "latest_persisted_quote_by_symbol",
         "source": source,
         "size_semantics": "turnover_preferred; volume_times_price_fallback; placeholder_when_missing",
         "change_semantics": "turnover_weighted_pct_change",

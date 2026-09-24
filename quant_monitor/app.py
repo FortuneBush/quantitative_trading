@@ -77,6 +77,7 @@ from quant_monitor.research import (
     ResearchRunManifest,
     build_governance_report,
     build_bank_fundamental_factors,
+    build_decision_readiness,
     verify_replay,
     verify_input_hash,
     strategy_code_version,
@@ -4077,6 +4078,35 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             (item.timestamp for item in contexts.values()),
             default=now_market_time(),
         )
+        # A complete factor window is still exploratory unless the decision
+        # instant is bound to an attested exchange calendar and an immutable
+        # point-in-time security universe.  This lookup is cache-only: a
+        # missing/ambiguous snapshot fails closed and never refreshes a
+        # provider or spends an upstream request.
+        decision_snapshot = None
+        try:
+            snapshots, snapshot_total = repo.query_universe_snapshots_as_of(
+                as_of=cohort_timestamp,
+                universe="a_share_banks",
+                session_date=cohort_timestamp.date(),
+                limit=2,
+                offset=0,
+            )
+            if snapshot_total == 1 and len(snapshots) == 1:
+                decision_snapshot = snapshots[0]
+        except (RuntimeError, TypeError, ValueError):
+            snapshots = ()
+            snapshot_total = 0
+        decision_readiness = build_decision_readiness(
+            calendar=active_runtime.current_trading_calendar(),
+            universe_source=active_runtime.universe_source,
+            universe_size=len(symbols),
+            minimum_universe=bank_strategy.min_universe,
+            point_in_time_snapshot=decision_snapshot,
+            as_of=cohort_timestamp,
+            expected_symbols=symbols,
+            session_date=cohort_timestamp.date(),
+        )
         try:
             # Bind fundamentals to the same decision instant as the price
             # cohort. A wall-clock snapshot taken later could leak a newly
@@ -4167,7 +4197,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 # entry gate was false while ``recommendation.action`` still
                 # said BUY/SELL, which was easy for a client to misread as a
                 # tradeable risk conclusion.
-                decision_ready = bool(bar_provenance[symbol]["quality_complete"])
+                decision_ready = bool(
+                    bar_provenance[symbol]["quality_complete"]
+                    and decision_readiness.decision_ready
+                )
                 raw_action = str(model["action"])
                 action = raw_action if decision_ready else "insufficient_data"
                 label = (
@@ -4232,21 +4265,27 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                         entry_failure_reasons.append("data_lineage_incomplete")
                 entry_eligible = bool(model.get("entry_eligible", False)) and bool(
                     bar_provenance[symbol]["quality_complete"]
+                    and decision_readiness.decision_ready
                 )
                 # A valid factor calculation is separate from a
                 # decision-grade result.  The former means the strategy had
                 # enough mathematically valid history; the latter additionally
                 # requires accepted immutable observation evidence.
                 analysis_ready = True
-                decision_ready_reason = (
-                    "ok"
-                    if bar_provenance[symbol]["quality_complete"]
-                    else (
+                if not bar_provenance[symbol]["quality_complete"]:
+                    decision_ready_reason = (
                         bar_provenance[symbol]["warnings"][0]
                         if bar_provenance[symbol]["warnings"]
                         else "data_quality_not_decision_ready"
                     )
-                )
+                elif not decision_readiness.decision_ready:
+                    decision_ready_reason = (
+                        decision_readiness.failures[0]
+                        if decision_readiness.failures
+                        else "decision_evidence_unverified"
+                    )
+                else:
+                    decision_ready_reason = "ok"
                 analysis = {
                     "symbol": symbol,
                     "name": instrument.name if instrument else symbol,
@@ -4325,6 +4364,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                         "analysis_ready": analysis_ready,
                         "decision_ready": decision_ready,
                         "decision_ready_reason": decision_ready_reason,
+                        "decision_gate": decision_readiness.to_dict(),
                         "authoritative": bar_provenance[symbol]["authoritative"],
                         "immutable_observation_count": bar_provenance[symbol][
                             "immutable_observation_count"
@@ -4408,10 +4448,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                             "status": "insufficient_data",
                             "analysis_ready": False,
                             "decision_ready": False,
-                            "decision_ready_reason": research.get("excluded", {}).get(symbol)
-                            or research.get("reason")
-                            or "insufficient_or_invalid_history",
-                            "bars_used": bars_count[symbol],
+                             "decision_ready_reason": research.get("excluded", {}).get(symbol)
+                             or research.get("reason")
+                             or "insufficient_or_invalid_history",
+                             "decision_gate": decision_readiness.to_dict(),
+                             "bars_used": bars_count[symbol],
                             "bars_required": bank_strategy.min_history,
                             "bar_as_of": (
                                 latest_bar_at[symbol].isoformat()
@@ -4491,15 +4532,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                         for symbol in research_by_symbol
                         if bar_provenance.get(symbol, {}).get("quality_complete")
                     ),
-                    "decision_ready": sum(
-                        1
-                        for symbol in research_by_symbol
-                        if bar_provenance.get(symbol, {}).get("quality_complete")
-                    ),
+                     "decision_ready": sum(
+                         1
+                         for symbol in research_by_symbol
+                         if bar_provenance.get(symbol, {}).get("quality_complete")
+                         and decision_readiness.decision_ready
+                     ),
+                     "decision_gate_ready": decision_readiness.decision_ready,
+                     "decision_gate_failures": list(decision_readiness.failures),
                     "common_as_of_ready": bool(research.get("ready")),
                     "analysis_reason": research.get("reason"),
                     "minimum_analysis_universe": bank_strategy.min_universe,
                 },
+                "decision_readiness": decision_readiness.to_dict(),
                 "summary": summary,
                 "fundamental_factors": fundamental_report,
                 "rankings": {
@@ -4599,6 +4644,35 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             max_stocks_per_industry=max_stocks_per_industry,
             source=active_runtime.provider.name,
         )
+        # Expose quote age separately from the request time.  A local
+        # cache hit is useful for the dashboard, but it must not be mistaken
+        # for a fresh provider tick or a provider WebSocket stream.
+        checked_at = now_market_time()
+        as_of = payload.get("as_of")
+        quote_age_seconds = None
+        freshness_state = "missing"
+        if as_of:
+            try:
+                quote_age_seconds = max(
+                    0.0,
+                    (checked_at - parse_market_time(as_of)).total_seconds(),
+                )
+                threshold = active_runtime.quote_stale_after_seconds
+                freshness_state = (
+                    "fresh"
+                    if threshold is None or quote_age_seconds <= float(threshold)
+                    else "stale"
+                )
+            except (TypeError, ValueError, OverflowError):
+                freshness_state = "unknown"
+        payload["freshness"] = {
+            "state": freshness_state,
+            "as_of": as_of,
+            "checked_at": checked_at.isoformat(),
+            "age_seconds": quote_age_seconds,
+            "stale_after_seconds": active_runtime.quote_stale_after_seconds,
+            "source": "latest_persisted_quote",
+        }
         payload["market_status"] = current_market_status()
         payload["provider"] = active_runtime.provider.name
         payload["universe_scope"] = "cached_catalogue"
@@ -4608,18 +4682,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.market_treemap_snapshot_builder = _build_market_treemap_snapshot
 
     @app.get("/api/v1/market/treemap")
+    @app.get("/api/v1/market/electronic-cloud", include_in_schema=False)
     @app.get("/api/v1/sectors/treemap", include_in_schema=False)
     async def market_treemap(
         max_industries: int = Query(default=200, ge=1, le=2000),
         max_stocks_per_industry: int = Query(default=500, ge=1, le=5000),
     ):
-        """Return a cache-only industry → stock treemap hierarchy.
+        """Return a cache-only electronic-cloud industry → stock hierarchy.
 
         The result is intentionally bounded and short-lived cached.  Querying
         this route is always local SQLite work (``upstream_requests=0``), so a
         dashboard reload cannot spend the provider's daily request budget.
         ``value``/``size`` is turnover-oriented, not market capitalisation;
-        clients should display the accompanying ``size_semantics`` label.
+        clients should display the accompanying ``size_semantics`` label.  The
+        ``electronic-cloud`` alias makes the visualization contract explicit,
+        while ``treemap`` remains the stable compatibility path.
         """
 
         now = time.monotonic()

@@ -363,6 +363,7 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         bars_cache_seconds: float = 86_400.0,
         instruments_cache_seconds: float = 604_800.0,
         daily_soft_limit: int = 90,
+        official_daily_limit: int = ASHAREHUB_OFFICIAL_DAILY_LIMIT,
         budget_path: Optional[os.PathLike] = None,
         retries: int = 0,
         retry_backoff_seconds: float = 0.5,
@@ -393,12 +394,17 @@ class AShareHubMarketDataProvider(MarketDataProvider):
                 raise ValueError("{} cannot be negative".format(name))
         if int(retries) < 0:
             raise ValueError("retries cannot be negative")
-        if not 1 <= int(daily_soft_limit) <= ASHAREHUB_OFFICIAL_DAILY_LIMIT:
-            raise ValueError("daily_soft_limit must be between 1 and 100")
+        if not 1 <= int(official_daily_limit) <= 100000:
+            raise ValueError("official_daily_limit must be between 1 and 100000")
+        if not 1 <= int(daily_soft_limit) <= int(official_daily_limit):
+            raise ValueError(
+                "daily_soft_limit must be between 1 and official daily limit"
+            )
 
         configured = tuple(dict.fromkeys(normalize_symbol(item) for item in symbols))
         self._api_key = normalized_key
         self._configured_symbols = configured
+        self._allow_batched_quotes = False
         self._instrument_names = {
             normalize_symbol(key): str(value).strip()
             for key, value in dict(instrument_names or {}).items()
@@ -417,6 +423,7 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         self.bars_cache_seconds = float(bars_cache_seconds)
         self.instruments_cache_seconds = float(instruments_cache_seconds)
         self.daily_soft_limit = int(daily_soft_limit)
+        self.official_daily_limit = int(official_daily_limit)
         self.budget_path = Path(budget_path) if budget_path is not None else _default_budget_path()
         self._credential_fingerprint = hashlib.sha256(
             normalized_key.encode("utf-8")
@@ -540,20 +547,30 @@ class AShareHubMarketDataProvider(MarketDataProvider):
 
     @property
     def quote_universe_scope(self) -> str:
-        # The quote route must not treat the static full-market catalogue as a
-        # polling target: one realtime basket is deliberately the watchlist.
+        # The quote route is always explicit: runtime configures either the
+        # watchlist/bank basket or an opted-in, batched market basket.  The
+        # catalogue itself is never implicitly treated as a quote target.
         return "configured_symbols"
 
     @property
     def configured_symbols(self) -> Tuple[str, ...]:
         return self._configured_symbols
 
-    def configure_symbols(self, symbols: Sequence[str]) -> Tuple[str, ...]:
+    @property
+    def realtime_batch_limit(self) -> int:
+        """Maximum symbols accepted by one upstream snapshot request."""
+
+        return ASHAREHUB_REALTIME_BATCH_LIMIT
+
+    def configure_symbols(
+        self, symbols: Sequence[str], *, allow_batched: bool = False
+    ) -> Tuple[str, ...]:
         """Replace the polling basket before monitoring starts.
 
         Runtime universe discovery uses the cached provider catalogue when it
-        is available.  Keeping this explicit avoids reaching into adapter
-        internals and preserves the documented 200-symbol realtime limit.
+        is available. Keeping this explicit avoids reaching into adapter
+        internals; market mode opts into 200-symbol batches while ordinary
+        baskets retain the single-request limit.
         """
 
         normalized = tuple(
@@ -561,9 +578,10 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         )
         if not normalized:
             raise ValueError("AShareHub requires at least one configured symbol")
-        if len(normalized) > ASHAREHUB_REALTIME_BATCH_LIMIT:
+        if len(normalized) > ASHAREHUB_REALTIME_BATCH_LIMIT and not allow_batched:
             raise ValueError("AShareHub realtime basket cannot exceed 200 symbols")
         self._configured_symbols = normalized
+        self._allow_batched_quotes = bool(allow_batched)
         self._last_quote_symbols = tuple(
             symbol for symbol in self._last_quote_symbols if symbol in normalized
         )
@@ -787,12 +805,22 @@ class AShareHubMarketDataProvider(MarketDataProvider):
             "subscribed_symbols": len(self._last_quote_symbols),
             "subscription_limit": ASHAREHUB_REALTIME_BATCH_LIMIT,
             "limited_symbols": max(
-                0, len(self._configured_symbols) - ASHAREHUB_REALTIME_BATCH_LIMIT
+                0,
+                len(self._configured_symbols) - ASHAREHUB_REALTIME_BATCH_LIMIT,
+            )
+            if not self._allow_batched_quotes
+            else 0,
+            "batch_count": max(
+                1,
+                (len(self._configured_symbols) + ASHAREHUB_REALTIME_BATCH_LIMIT - 1)
+                // ASHAREHUB_REALTIME_BATCH_LIMIT,
             ),
+            "batched_quotes": bool(self._allow_batched_quotes),
             "last_error_type": self._last_error_type,
             "last_http_status": self._last_http_status,
             "requests_used_today": used,
             "daily_soft_limit": self.daily_soft_limit,
+            "official_daily_limit": self.official_daily_limit,
             "requests_remaining_soft": max(0, self.daily_soft_limit - used),
             "local_budget_exhausted": local_budget_exhausted,
             "upstream_quota_exhausted": upstream_quota_exhausted,
@@ -1694,10 +1722,40 @@ class AShareHubMarketDataProvider(MarketDataProvider):
         return [by_symbol[symbol] for symbol in requested if symbol in by_symbol]
 
     async def fetch_quotes(self, symbols: Sequence[str]) -> List[Quote]:
-        return await self._fetch_quotes(symbols, strict=self.strict_symbols)
+        requested = tuple(dict.fromkeys(normalize_symbol(item) for item in symbols))
+        if len(requested) <= ASHAREHUB_REALTIME_BATCH_LIMIT:
+            return await self._fetch_quotes(requested, strict=self.strict_symbols)
+        if not self._allow_batched_quotes:
+            raise ValueError(
+                "AShareHub realtime basket supports at most 200 symbols per request"
+            )
+        result: List[Quote] = []
+        for start in range(0, len(requested), ASHAREHUB_REALTIME_BATCH_LIMIT):
+            result.extend(
+                await self._fetch_quotes(
+                    requested[start : start + ASHAREHUB_REALTIME_BATCH_LIMIT],
+                    strict=self.strict_symbols,
+                )
+            )
+        return result
 
     async def fetch_quotes_relaxed(self, symbols: Sequence[str]) -> List[Quote]:
-        return await self._fetch_quotes(symbols, strict=False)
+        requested = tuple(dict.fromkeys(normalize_symbol(item) for item in symbols))
+        if len(requested) <= ASHAREHUB_REALTIME_BATCH_LIMIT:
+            return await self._fetch_quotes(requested, strict=False)
+        if not self._allow_batched_quotes:
+            raise ValueError(
+                "AShareHub realtime basket supports at most 200 symbols per request"
+            )
+        result: List[Quote] = []
+        for start in range(0, len(requested), ASHAREHUB_REALTIME_BATCH_LIMIT):
+            result.extend(
+                await self._fetch_quotes(
+                    requested[start : start + ASHAREHUB_REALTIME_BATCH_LIMIT],
+                    strict=False,
+                )
+            )
+        return result
 
     def seed_quotes(self, quotes: Sequence[Quote]) -> int:
         """Hydrate provider cache from SQLite without making rows newly fresh."""

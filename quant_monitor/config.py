@@ -57,11 +57,19 @@ class Settings:
     asharehub_base_url: str = "https://asharehub.com"
     asharehub_request_timeout_seconds: float = 15.0
     asharehub_quote_cache_seconds: float = 300.0
+    # A full-market basket is fetched in 200-symbol requests.  A longer cache
+    # TTL keeps the aggregate request count below the documented daily plan
+    # while preserving the normal five-minute bank/watchlist cadence.
+    asharehub_market_quote_cache_seconds: float = 3600.0
     asharehub_bars_cache_seconds: float = 86400.0
     asharehub_instruments_cache_seconds: float = 604800.0
     asharehub_retries: int = 0
     asharehub_retry_backoff_seconds: float = 0.5
     asharehub_daily_soft_limit: int = 90
+    # Provider plan allowance.  The shipped AShareHub profile uses the user's
+    # 1,000-request daily plan while direct Settings callers retain the
+    # conservative historical default of 100.
+    asharehub_official_daily_limit: int = 100
     # Keep part of the local allowance available for live basket quotes and
     # explicit user actions while background daily-history work is running.
     asharehub_history_reserve_requests: int = 10
@@ -153,8 +161,8 @@ class Settings:
         ) > 200:
             raise ValueError("AShareHub watchlist cannot exceed 200 symbols")
         universe_mode = str(self.universe_mode).strip().lower()
-        if universe_mode not in {"watchlist", "bank"}:
-            raise ValueError("universe_mode must be 'watchlist' or 'bank'")
+        if universe_mode not in {"watchlist", "bank", "market"}:
+            raise ValueError("universe_mode must be 'watchlist', 'bank' or 'market'")
         object.__setattr__(self, "universe_mode", universe_mode)
         if not str(self.universe_industry).strip():
             raise ValueError("universe_industry cannot be empty")
@@ -185,6 +193,7 @@ class Settings:
             raise ValueError("asharehub_request_timeout_seconds must be positive")
         for name in (
             "asharehub_quote_cache_seconds",
+            "asharehub_market_quote_cache_seconds",
             "asharehub_bars_cache_seconds",
             "asharehub_instruments_cache_seconds",
             "asharehub_retry_backoff_seconds",
@@ -195,8 +204,13 @@ class Settings:
                 raise ValueError("{} cannot be negative".format(name))
         if int(self.asharehub_retries) < 0:
             raise ValueError("asharehub_retries cannot be negative")
-        if not 1 <= int(self.asharehub_daily_soft_limit) <= 100:
-            raise ValueError("asharehub_daily_soft_limit must be between 1 and 100")
+        official_limit = int(self.asharehub_official_daily_limit)
+        if not 1 <= official_limit <= 100000:
+            raise ValueError("asharehub_official_daily_limit must be between 1 and 100000")
+        if not 1 <= int(self.asharehub_daily_soft_limit) <= official_limit:
+            raise ValueError(
+                "asharehub_daily_soft_limit must be between 1 and official daily limit"
+            )
         if not 0 <= int(self.asharehub_history_reserve_requests) < int(
             self.asharehub_daily_soft_limit
         ):
@@ -279,9 +293,11 @@ class Settings:
             "api_max_request_body_bytes": self.api_max_request_body_bytes,
             "asharehub_request_timeout_seconds": self.asharehub_request_timeout_seconds,
             "asharehub_quote_cache_seconds": self.asharehub_quote_cache_seconds,
+            "asharehub_market_quote_cache_seconds": self.asharehub_market_quote_cache_seconds,
             "asharehub_bars_cache_seconds": self.asharehub_bars_cache_seconds,
             "asharehub_instruments_cache_seconds": self.asharehub_instruments_cache_seconds,
             "asharehub_daily_soft_limit": self.asharehub_daily_soft_limit,
+            "asharehub_official_daily_limit": self.asharehub_official_daily_limit,
             "asharehub_history_reserve_requests": self.asharehub_history_reserve_requests,
             "asharehub_history_refresh_seconds": self.asharehub_history_refresh_seconds,
             "asharehub_trade_calendar_enabled": self.asharehub_trade_calendar_enabled,
@@ -312,11 +328,13 @@ _COERCERS = {
     "mock_seed": int,
     "asharehub_request_timeout_seconds": float,
     "asharehub_quote_cache_seconds": float,
+    "asharehub_market_quote_cache_seconds": float,
     "asharehub_bars_cache_seconds": float,
     "asharehub_instruments_cache_seconds": float,
     "asharehub_retries": int,
     "asharehub_retry_backoff_seconds": float,
     "asharehub_daily_soft_limit": int,
+    "asharehub_official_daily_limit": int,
     "asharehub_history_reserve_requests": int,
     "asharehub_history_refresh_seconds": float,
     "asharehub_trade_calendar_cache_seconds": float,

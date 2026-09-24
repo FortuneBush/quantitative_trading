@@ -809,6 +809,34 @@ def test_realtime_rejects_more_than_official_200_symbol_basket(tmp_path):
     assert asyncio.run(exercise()) == []
 
 
+def test_market_mode_batches_configured_symbols_into_200_symbol_requests(tmp_path):
+    async def exercise():
+        symbols = ["{:06d}.SH".format(index) for index in range(401)]
+
+        class BatchRequester(Requester):
+            def __call__(self, method, url, headers, params, timeout):
+                self.calls.append((method, url, dict(headers), dict(params), timeout))
+                requested = params.get("symbol", "").split(",")
+                return [quote_row(symbol=symbol) for symbol in requested]
+
+        requester = BatchRequester()
+        target = provider(tmp_path, requester)
+        target.strict_symbols = False
+        target.configure_symbols(symbols, allow_batched=True)
+        result = await target.fetch_quotes(symbols)
+        status = target.realtime_status
+        await target.close()
+        return requester.calls, result, status
+
+    calls, result, status = asyncio.run(exercise())
+    assert len(calls) == 3
+    assert len(result) == 401
+    assert status["requested_symbols"] == 401
+    assert status["batch_count"] == 3
+    assert status["batched_quotes"] is True
+    assert status["limited_symbols"] == 0
+
+
 def test_daily_bars_units_order_dates_filters_and_cache(tmp_path):
     async def exercise():
         clock = Clock(datetime(2026, 8, 28, 18, 0, tzinfo=SHANGHAI_TZ))

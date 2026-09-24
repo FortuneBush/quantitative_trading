@@ -1216,6 +1216,10 @@ class BacktestEngine:
             return "effective sell price reached or fell below supplied limit_down_price"
         if reason == "zero_volume_execution_bar":
             return "the supplied execution bar had zero volume; suspension is not inferred"
+        if reason == "missing_tradeability_constraint":
+            return "strict execution policy requires an explicit point-in-time tradeability constraint"
+        if reason == "volume_capacity_too_low":
+            return "the participation cap permits less than one exchange lot on the execution bar"
         return "explicit trading constraint or zero-volume bar prevented execution"
 
     def _record_market_skip(
@@ -1258,6 +1262,8 @@ class BacktestEngine:
                 return "explicit_buy_not_allowed"
             if signal.action == SignalAction.SELL and not constraint.can_sell:
                 return "explicit_sell_not_allowed"
+        if self.config.require_explicit_tradeability and constraint is None:
+            return "missing_tradeability_constraint"
         if bar is None:
             return "missing_execution_bar"
         if bar.volume <= 0:
@@ -1313,6 +1319,23 @@ class BacktestEngine:
         lot_notional = price * Decimal(lot_size)
         lots = int(budget // lot_notional) if lot_notional > 0 else 0
         quantity = lots * lot_size
+        capacity_limited = False
+        capacity_quantity = self._volume_capacity_quantity(bar)
+        if capacity_quantity is not None:
+            if capacity_quantity < lot_size:
+                skipped.append(
+                    SkippedExecution(
+                        signal,
+                        timestamp,
+                        "volume_capacity_too_low",
+                        detail="participation cap is below one exchange lot",
+                        will_retry=False,
+                    )
+                )
+                return cash
+            if quantity > capacity_quantity:
+                quantity = capacity_quantity
+                capacity_limited = True
         while quantity > 0:
             gross = self._money(price * Decimal(quantity))
             commission = self._commission(gross, self.config.buy_commission_rate)
@@ -1349,6 +1372,16 @@ class BacktestEngine:
                 tradeability_verified=tradeability_verified,
             )
         )
+        if capacity_limited:
+            skipped.append(
+                SkippedExecution(
+                    signal,
+                    timestamp,
+                    "volume_participation_capped",
+                    detail="buy quantity was reduced to the configured execution-bar participation cap",
+                    will_retry=False,
+                )
+            )
         return cash
 
     def _sell(
@@ -1396,6 +1429,23 @@ class BacktestEngine:
                 )
             )
             return cash, None
+        capacity_limited = False
+        capacity_quantity = self._volume_capacity_quantity(bar)
+        if capacity_quantity is not None:
+            if capacity_quantity < self._lot_size(signal.symbol):
+                skipped.append(
+                    SkippedExecution(
+                        signal,
+                        timestamp,
+                        "volume_capacity_too_low",
+                        detail="participation cap is below one exchange lot",
+                        will_retry=False,
+                    )
+                )
+                return cash, None
+            if quantity > capacity_quantity:
+                quantity = capacity_quantity
+                capacity_limited = True
         gross = self._money(price * Decimal(quantity))
         commission = self._commission(gross, self.config.sell_commission_rate)
         stamp_duty = self._money(gross * self.config.stamp_duty_rate)
@@ -1423,7 +1473,33 @@ class BacktestEngine:
                 realized_pnl=realized_pnl,
             )
         )
+        if capacity_limited:
+            skipped.append(
+                SkippedExecution(
+                    signal,
+                    timestamp,
+                    "volume_participation_capped",
+                    detail="sell quantity was reduced to the configured execution-bar participation cap",
+                    will_retry=False,
+                )
+            )
         return cash, None
+
+    def _volume_capacity_quantity(self, bar: Bar) -> Optional[int]:
+        """Return a lot-rounded maximum quantity for one execution bar.
+
+        Daily bars expose aggregate volume only.  When an explicit
+        participation cap is configured, the engine treats it as a bounded
+        executable quantity and records any reduction as a skipped execution
+        diagnostic.  ``None`` preserves the legacy exploratory model.
+        """
+
+        rate = self.config.max_volume_participation_rate
+        if rate is None:
+            return None
+        lot_size = self._lot_size(bar.symbol)
+        raw = int(Decimal(bar.volume) * rate)
+        return (raw // lot_size) * lot_size
 
     def _lot_size(self, symbol: str) -> int:
         instrument = self._instruments.get(symbol)
@@ -1603,6 +1679,17 @@ class BacktestEngine:
                 "valuation_price_basis": "raw_unadjusted",
                 "missing_execution_bar": "unknown_availability_not_suspension",
                 "unconstrained_positive_volume_bar": "fill_allowed_but_tradeability_unverified",
+                "require_explicit_tradeability": self.config.require_explicit_tradeability,
+                "max_volume_participation_rate": (
+                    str(self.config.max_volume_participation_rate)
+                    if self.config.max_volume_participation_rate is not None
+                    else None
+                ),
+                "volume_execution_model": (
+                    "bar_volume_participation_cap"
+                    if self.config.max_volume_participation_rate is not None
+                    else "unbounded_daily_bar"
+                ),
                 "portfolio_mapping": "sell_first_equal_cash_split_no_pyramiding",
                 "bar_sources": bar_sources,
                 "calendar_source": calendar_metadata.identifier,

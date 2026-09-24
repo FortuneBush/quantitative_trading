@@ -62,6 +62,22 @@ def test_treemap_groups_industry_and_uses_newest_quote():
     assert banks["children"][0]["size_basis"] == "turnover"
     assert banks["children"][0]["pct_change"] == pytest.approx(22.222222, rel=1e-6)
     assert banks["decliners"] == 1
+    assert payload["visualization"] == "electronic_cloud"
+    assert payload["data_version"] == "market-treemap-v2"
+    assert payload["coverage"] == {
+        "catalogue_count": 3,
+        "priced_count": 3,
+        "unpriced_count": 0,
+        "quote_coverage": 1.0,
+        "visible_stock_count": 3,
+    }
+    assert payload["breadth"]["advancers"] == 1
+    assert payload["breadth"]["decliners"] == 1
+    assert payload["breadth"]["unchanged"] == 1
+    assert banks["breadth"]["median_pct_change"] == pytest.approx(5.555556, rel=1e-6)
+    assert banks["total_volume"] == 200
+    assert banks["top_gainers"][0]["symbol"] == "600000.SH"
+    assert banks["top_decliners"][0]["symbol"] == "000001.SZ"
 
 
 def test_treemap_keeps_missing_quotes_out_of_tiles_and_reports_coverage():
@@ -167,4 +183,3 @@ def test_industry_limit_is_deterministic_and_reports_omitted_groups():
     assert payload["count"] == 1
     assert payload["omitted_industry_count"] == 1
     assert payload["items"][0]["name"] == "电子"
-

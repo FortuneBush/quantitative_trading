@@ -25,7 +25,7 @@ from quant_monitor.data_sources.asharehub import (
     AShareHubAuthenticationError,
     AShareHubRateLimitError,
 )
-from quant_monitor.domain import Bar, Exchange, Instrument, Quote, SHANGHAI_TZ
+from quant_monitor.domain import Bar, Exchange, Instrument, Quote, SecurityType, SHANGHAI_TZ
 from quant_monitor.domain import (
     CollectionBatch,
     CollectionBatchStatus,
@@ -134,6 +134,42 @@ def test_runtime_selects_asharehub_without_network_on_construction(tmp_path):
         assert status["calendar_readiness"]["reason"] == "calendar_disabled"
         assert api_key not in json.dumps(status)
         assert status["database"] == {"type": "sqlite", "state": "disconnected"}
+    finally:
+        runtime.repository.close()
+
+
+def test_market_universe_uses_complete_cached_catalogue_and_batched_provider(tmp_path):
+    runtime = ApplicationRuntime(
+        Settings(
+            data_provider="asharehub",
+            universe_mode="market",
+            asharehub_api_key="unit-test-asharehub-key",
+            asharehub_budget_path=str(tmp_path / "budget.json"),
+            database_path=str(tmp_path / "market.sqlite3"),
+            watchlist=["600519.SH"],
+        )
+    )
+    try:
+        runtime.repository.initialize()
+        instruments = []
+        for index in range(1000):
+            exchange = Exchange.SH if index % 2 == 0 else Exchange.SZ
+            instruments.append(
+                Instrument(
+                    symbol="{:06d}.{}".format(index, exchange.value),
+                    name="测试证券{}".format(index),
+                    exchange=exchange,
+                    security_type=SecurityType.STOCK,
+                    active=True,
+                    metadata={"source": "asharehub", "industry": "综合"},
+                )
+            )
+        runtime.repository.upsert_instruments(instruments)
+        runtime._configure_research_universe_from_cache()
+        assert len(runtime.symbols) == 1000
+        assert runtime.universe_source == "asharehub_market_catalogue"
+        assert runtime.provider.realtime_status["batched_quotes"] is True
+        assert runtime.provider.realtime_status["batch_count"] == 5
     finally:
         runtime.repository.close()
 

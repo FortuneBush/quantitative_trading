@@ -6,7 +6,7 @@
 
 平台只用于数据研究、监控和辅助决策，不连接券商交易柜台，不创建、提交或撤销订单，也不承诺数据完整性、实时性或投资收益。`buy` / `sell` 只是研究信号，不是交易指令。真实资金决策前，应独立核验行情、公司行为、交易状态和交易所规则。
 
-运行时支持 `AShareHubMarketDataProvider`、`AllTickMarketDataProvider`、`AkShareMarketDataProvider` 与 `MockMarketDataProvider`。AShareHub 只有 HTTP 拉取：实时端点一次最多 200 个代码，日线和证券目录使用长缓存；本地按上海自然日持久化请求计数，并在 100 次供应商额度前以 90 次软预算熔断。它不提供官方股票 WebSocket、逐笔、五档盘口或分钟 K 线，本地 `/ws/market` 只转发已采集领域事件。API 读取按当前 provider 的 `source` 隔离；AllTick 的原有 HTTP/WS 能力和 AKShare 兼容源仍可显式启用。
+运行时支持 `AShareHubMarketDataProvider`、`AllTickMarketDataProvider`、`AkShareMarketDataProvider` 与 `MockMarketDataProvider`。AShareHub 只有 HTTP 拉取：实时端点一次最多 200 个代码，日线和证券目录使用长缓存；`universe_mode=market` 会从完整证券目录筛选 active 股票并按 200 只分批，报价缓存延长到 3,600 秒，以便在用户配置的 1,000 次/日方案下完成有限频率的全市场覆盖。`asharehub_official_daily_limit` 表示套餐上限，`asharehub_daily_soft_limit` 是本地熔断值，两者都会进入状态和预算审计。它不提供官方股票 WebSocket、逐笔、五档盘口或分钟 K 线，本地 `/ws/market` 只转发已采集领域事件。API 读取按当前 provider 的 `source` 隔离；AllTick 的原有 HTTP/WS 能力和 AKShare 兼容源仍可显式启用。
 
 ## 2. 组件与职责
 
@@ -59,9 +59,14 @@ flowchart LR
 6. 采集层异常被转换为 `critical` 告警和进程内 `error` 事件；轮询循环记录错误后继续下一周期。
 7. `ApplicationRuntime` 订阅全部事件，并以 best-effort 方式广播给每个 WebSocket 客户端。REST 查询主要从 SQLite 读取；系统状态来自监控服务的线程安全内存快照。
 
-应用启动时只初始化数据库、恢复本地缓存并订阅事件，不等待真实 provider 网络响应。AShareHub 报价在监控任务中后台轮询，日线由独立作业按证券逐只获取并立即持久化；中途失败或进程退出不会丢失已完成进度。历史作业保留部分软预算给报价/人工操作，达到保留线后暂停并在预算重置后继续。证券目录刷新同样在后台执行。页面刷新和进程重启不会绕过持久化预算。停止时先通知任务，在有界宽限后取消仍卡住的协程，再关闭 provider 和数据库。
+应用启动时只初始化数据库、恢复本地缓存并订阅事件；银行/自选模式不等待真实 provider 网络响应。`universe_mode=market` 在缓存目录不足 1,000 条时会显式执行一次目录刷新，以便在监控启动前构造可审计的完整股票池；目录请求失败或不完整时退回配置自选列表并标明来源。AShareHub 报价在监控任务中后台轮询，市场模式按 200 只分批并复用长报价缓存，日线仍由独立作业按配置研究股票逐只获取并立即持久化；中途失败或进程退出不会丢失已完成进度。历史作业保留部分软预算给报价/人工操作，达到保留线后暂停并在预算重置后继续。页面刷新和进程重启不会绕过持久化预算。停止时先通知任务，在有界宽限后取消仍卡住的协程，再关闭 provider 和数据库。
 
 AShareHub 银行目录的“策略最低样本”与“目录完整性”是两个门槛：后者保守要求至少 1,000 条证券、40 只可分类银行且所有记录来源一致，才允许在一个 SQLite 事务内替换目录。未通过时继续使用明确标注的 42 只静态兜底，并保留原目录；不能在 15 只截断样本上生成横截面结论。
+
+市场模式的行情覆盖率与目录覆盖率是两个独立指标：目录完整只说明证券主数据已收录，
+`quote_coverage_ratio` 仍按最近一轮实际收到的快照计算；停牌、无成交、权限拒绝、预算熔断或
+上游部分响应都可能使行情覆盖率低于 1。覆盖率不足时保留缺失清单和 provider 状态，不能用
+零价格或上一只股票的价格填充。
 
 ## 4. 一致性、并发与故障语义
 
