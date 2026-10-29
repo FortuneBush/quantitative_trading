@@ -138,3 +138,33 @@ test('bank market note discloses freshness coverage instead of only provider sta
   assert.match(source, /setAttribute\("aria-live", "polite"\)/);
   assert.match(source, /refreshMarketFreshnessSummary\(\);/);
 });
+
+test('daily decision digest keeps the research-only boundary visible', () => {
+  const index = fs.readFileSync(path.join(__dirname, '../../quant_monitor/web/index.html'), 'utf8');
+  assert.match(source, /function renderDecisionDigest\(payload\)/);
+  assert.match(source, /function loadDecisionDigest\(\)/);
+  assert.match(source, /dashboard\/daily\?limit=50/);
+  assert.match(source, /research_assurance/);
+  assert.match(source, /orders_supported/);
+  assert.match(index, /id="decision-digest-panel"/);
+  assert.match(index, /id="decision-digest-quality"/);
+  assert.match(index, /每日决策摘要/);
+});
+
+test('workspace navigation and local preferences are wired into the dashboard contract', () => {
+  const index = fs.readFileSync(path.join(__dirname, '../../quant_monitor/web/index.html'), 'utf8');
+  const styles = fs.readFileSync(path.join(__dirname, '../../quant_monitor/web/styles.css'), 'utf8');
+  assert.match(index, /class="view-nav-link active"/);
+  assert.match(index, /id="theme-toggle"/);
+  assert.match(index, /id="density-toggle"/);
+  assert.match(index, /id="task-strip"/);
+  assert.match(index, /id="bank-filter"/);
+  assert.match(source, /function applyPreferences()/);
+  assert.match(source, /function renderTaskStrip\(payload\)/);
+  assert.match(source, /localStorage\.setItem\("quant-monitor-theme"/);
+  assert.match(source, /bindWorkspaceNavigation()/);
+  assert.match(source, /state.bankFilter/);
+  assert.match(styles, /.hero-dashboard-grid/);
+  assert.match(styles, /body\[data-theme="light"\]/);
+  assert.match(styles, /\.compact-mode/);
+});

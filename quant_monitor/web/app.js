@@ -51,6 +51,9 @@ function quantMonitorFreshnessSummary(states) {
     bankSearch: "",
     bankExchange: "all",
     bankSort: "change_desc",
+    bankFilter: "all",
+    theme: "dark",
+    compact: false,
     marketQuotes: [],
     marketSummary: null,
     sectorTreemapPayload: null,
@@ -98,6 +101,21 @@ function quantMonitorFreshnessSummary(states) {
     sectorTreemapLive: el("sector-treemap-live"),
     sectorTreemapCoverage: el("sector-treemap-coverage"),
     sectorTreemapNote: el("sector-treemap-note"),
+    decisionDigestStatus: el("decision-digest-status"),
+    decisionDigestSummary: el("decision-digest-summary"),
+    decisionDigestQuality: el("decision-digest-quality"),
+    decisionDigestWarnings: el("decision-digest-warnings"),
+    themeToggle: el("theme-toggle"),
+    densityToggle: el("density-toggle"),
+    viewNavLinks: [...document.querySelectorAll(".view-nav-link")],
+    bankFilter: el("bank-filter"),
+    taskStripBadge: el("task-strip-badge"),
+    taskCollectorIcon: el("task-collector-icon"),
+    taskCollectorText: el("task-collector-text"),
+    taskHistoryIcon: el("task-history-icon"),
+    taskHistoryText: el("task-history-text"),
+    taskResearchIcon: el("task-research-icon"),
+    taskResearchText: el("task-research-text"),
     bankQuotaBadge: el("bank-quota-badge"),
     analysisName: el("analysis-name"),
     analysisSymbol: el("analysis-symbol"),
@@ -248,6 +266,47 @@ function quantMonitorFreshnessSummary(states) {
   function directionClass(change) {
     const value = finiteNumber(change);
     return value === null || value === 0 ? "flat" : value > 0 ? "up" : "down";
+  }
+
+  function renderDecisionDigest(payload) {
+    const data = payload && typeof payload === "object" ? payload : {};
+    const summary = data.summary && typeof data.summary === "object" ? data.summary : {};
+    const signals = summary.signal_counts && typeof summary.signal_counts === "object" ? summary.signal_counts : {};
+    const quality = data.data_quality && typeof data.data_quality === "object" ? data.data_quality : {};
+    const research = data.research_assurance && typeof data.research_assurance === "object" ? data.research_assurance : {};
+    const researchOnly = data.research_only === true || research.research_only === true;
+    const ordersSupported = data.orders_supported === true || research.orders_supported === true;
+    const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+    if (dom.decisionDigestSummary) {
+      dom.decisionDigestSummary.textContent = `覆盖 ${summary.quoted_symbols ?? 0}/${summary.configured_symbols ?? 0} · 上涨 ${summary.advancers ?? 0} · 下跌 ${summary.decliners ?? 0} · 信号 买 ${signals.buy ?? 0} / 持 ${signals.hold ?? 0} / 卖 ${signals.sell ?? 0}`;
+    }
+    if (dom.decisionDigestQuality) {
+      const freshness = quality.freshness_counts && typeof quality.freshness_counts === "object" ? quality.freshness_counts : {};
+      const fresh = freshness.fresh ?? 0;
+      const stale = (freshness.stale ?? 0) + (freshness.future_timestamp ?? 0) + (freshness.unknown ?? 0);
+      const boundary = researchOnly && ordersSupported !== true ? "仅研究，不支持下单" : "研究边界待核验";
+      const decisionReady = research.decision_ready === true;
+      dom.decisionDigestQuality.textContent = `数据质量：${quality.ready === true ? "就绪" : "待核验"} · 新鲜 ${fresh} · 待核验 ${stale} · 历史研究 ${research.ready === true ? "就绪" : "待补数"} · 决策认证 ${decisionReady ? "已认证" : "未认证"} · ${boundary}`;
+    }
+    if (dom.decisionDigestWarnings) {
+      dom.decisionDigestWarnings.textContent = `限制：${warnings.length ? warnings.join("、") : "无"} · ${data.notice || "仅用于研究，不构成投资建议或交易指令"}`;
+    }
+    if (dom.decisionDigestStatus) {
+      setPill(dom.decisionDigestStatus, warnings.length ? "有数据限制" : "缓存摘要已更新", warnings.length ? "warning" : "ok");
+      dom.decisionDigestStatus.title = data.as_of ? `行情截至 ${formatTime(data.as_of, true)}` : "尚无可用行情快照";
+    }
+  }
+
+  async function loadDecisionDigest() {
+    try {
+      const payload = await fetchJSON(`${API_BASE}/dashboard/daily?limit=50`);
+      renderDecisionDigest(payload);
+      return payload;
+    } catch (error) {
+      if (dom.decisionDigestStatus) setPill(dom.decisionDigestStatus, "摘要暂不可用", "bad");
+      if (dom.decisionDigestWarnings) dom.decisionDigestWarnings.textContent = requestErrorMessage(error, "每日摘要接口暂不可用");
+      return null;
+    }
   }
 
   function toDate(value) {
@@ -1050,7 +1109,14 @@ function quantMonitorFreshnessSummary(states) {
     const rows = state.watchlist.filter((item) => {
       const matchesSearch = !search || item.symbol.toLowerCase().includes(search) || item.name.toLocaleLowerCase("zh-CN").includes(search);
       const matchesExchange = state.bankExchange === "all" || item.exchange === state.bankExchange;
-      return matchesSearch && matchesExchange;
+      const action = String(item.researchAction || "").toLowerCase();
+      const hasResearch = Boolean(item.analysis || item.researchScore !== null || action);
+      const freshness = quoteFreshness(item);
+      const needsReview = ["stale", "future_timestamp", "missing", "unknown"].includes(freshness);
+      const matchesFilter = state.bankFilter === "all"
+        || state.bankFilter === "signals" && hasResearch
+        || state.bankFilter === "review" && needsReview;
+      return matchesSearch && matchesExchange && matchesFilter;
     });
     const knownLast = (value, ascending = false) => value === null ? (ascending ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY) : value;
     rows.sort((a, b) => {
@@ -1693,9 +1759,55 @@ function quantMonitorFreshnessSummary(states) {
     dom.readinessPercent.textContent = `${percentage}%`;
   }
 
+  function renderTaskStrip(payload) {
+    if (!dom.taskStripBadge) return;
+    const data = objectFrom(payload);
+    const collector = objectFrom(firstDefined(data, ["collector"], {}));
+    const startup = objectFrom(firstDefined(data, ["startup", "bootstrap"], {}));
+    const history = objectFrom(firstDefined(startup, ["history_bootstrap", "history", "daily_bars"], firstDefined(data, ["history_bootstrap"], {})));
+    const collectorState = String(firstDefined(collector, ["status", "state"], "")).toLowerCase();
+    const collectorRunning = firstDefined(collector, ["running", "active"], null) === true
+      || ["running", "active", "ok", "healthy"].includes(collectorState);
+    const collectorError = firstDefined(collector, ["last_error", "error"], null);
+    const collectorTone = collectorError ? "bad" : collectorRunning ? "ok" : "warning";
+    const collectorText = collectorError ? "最近一次有错误" : collectorRunning ? "运行中" : "等待采集";
+
+    const total = Math.max(0, finiteNumber(firstDefined(history, ["total", "configured", "target"], firstDefined(startup, ["history_total"], 0))) || 0);
+    const ready = Math.max(0, finiteNumber(firstDefined(history, ["ready", "completed", "available"], firstDefined(startup, ["history_ready"], 0))) || 0);
+    const historyState = String(firstDefined(history, ["state", "status"], "")).toLowerCase();
+    const historyNotRequired = ["not_required", "disabled", "off"].includes(historyState)
+      || firstDefined(startup, ["history_required"], null) === false;
+    const deferred = firstDefined(history, ["deferred_for_budget", "deferred"], false) === true
+      || ["deferred_budget", "quota_deferred", "budget_deferred"].includes(historyState);
+    const historyComplete = historyNotRequired || total > 0 && ready >= total && !deferred;
+    const historyTone = historyNotRequired || historyComplete ? "ok" : deferred ? "warning" : ["failed", "error", "stopped"].includes(historyState) ? "bad" : "warning";
+    const historyText = historyNotRequired ? "无需补数" : deferred ? "额度暂缓" : historyComplete ? `${ready}/${total} 已完成` : total ? `${ready}/${total} 补数中` : "等待任务";
+
+    const researchReady = firstDefined(startup, ["research_ready"], null);
+    const researchTone = researchReady === true ? "ok" : researchReady === false ? "warning" : "neutral";
+    const researchText = researchReady === true ? "历史覆盖满足" : String(firstDefined(startup, ["research_ready_reason"], "准备中"));
+    const statuses = [collectorTone, historyTone, researchTone];
+    const overallTone = statuses.includes("bad") ? "bad" : statuses.includes("warning") ? "warning" : statuses.includes("ok") ? "ok" : "neutral";
+    const overallLabel = overallTone === "ok" ? "工作区就绪" : overallTone === "bad" ? "需要处理" : overallTone === "warning" ? "部分准备" : "检查中";
+
+    const setTask = (icon, tone) => {
+      if (!icon) return;
+      icon.className = `task-status-icon ${tone}`;
+      icon.textContent = tone === "ok" ? "●" : tone === "bad" ? "!" : tone === "warning" ? "!" : "·";
+    };
+    setPill(dom.taskStripBadge, overallLabel, overallTone);
+    setTask(dom.taskCollectorIcon, collectorTone);
+    setTask(dom.taskHistoryIcon, historyTone);
+    setTask(dom.taskResearchIcon, researchTone);
+    if (dom.taskCollectorText) dom.taskCollectorText.textContent = collectorText;
+    if (dom.taskHistoryText) dom.taskHistoryText.textContent = historyText;
+    if (dom.taskResearchText) dom.taskResearchText.textContent = researchText;
+  }
+
   function renderSystem(payload) {
     const data = objectFrom(payload);
     state.lastSystem = data;
+    renderTaskStrip(data);
     // The system endpoint carries the provider's freshness threshold.  Apply
     // it to already-rendered rows so a later health poll can relabel cached
     // quotes without fetching each detail endpoint again.
@@ -2333,6 +2445,7 @@ function quantMonitorFreshnessSummary(states) {
       }
       const tasks = [
         ...(sectorLoaded ? [] : [loadOverview(), loadWatchlist()]),
+        loadDecisionDigest(),
         loadSectorTreemap(),
         loadAlerts(),
         loadSignals(),
@@ -2560,6 +2673,54 @@ function quantMonitorFreshnessSummary(states) {
     setPill(dom.marketBadge, text, status);
   }
 
+  function applyPreferences() {
+    let theme = "dark";
+    let compact = false;
+    try {
+      theme = window.localStorage.getItem("quant-monitor-theme") === "light" ? "light" : "dark";
+      compact = window.localStorage.getItem("quant-monitor-density") === "compact";
+    } catch {
+      // Preferences are optional; a restricted browser storage context keeps defaults.
+    }
+    state.theme = theme;
+    state.compact = compact;
+    document.body.dataset.theme = theme;
+    document.body.classList.toggle("compact-mode", compact);
+    if (dom.themeToggle) {
+      dom.themeToggle.textContent = theme === "light" ? "☾" : "☼";
+      dom.themeToggle.title = theme === "light" ? "切换到深色主题" : "切换到浅色主题";
+      dom.themeToggle.setAttribute("aria-label", dom.themeToggle.title);
+    }
+    if (dom.densityToggle) {
+      dom.densityToggle.textContent = compact ? "↕" : "↕";
+      dom.densityToggle.title = compact ? "切换到舒适布局" : "切换紧凑布局";
+      dom.densityToggle.setAttribute("aria-label", dom.densityToggle.title);
+      dom.densityToggle.dataset.active = compact ? "true" : "false";
+    }
+  }
+
+  function toggleTheme() {
+    state.theme = state.theme === "light" ? "dark" : "light";
+    try { window.localStorage.setItem("quant-monitor-theme", state.theme); } catch { /* optional */ }
+    applyPreferences();
+  }
+
+  function toggleDensity() {
+    state.compact = !state.compact;
+    try { window.localStorage.setItem("quant-monitor-density", state.compact ? "compact" : "comfortable"); } catch { /* optional */ }
+    applyPreferences();
+  }
+
+  function bindWorkspaceNavigation() {
+    dom.viewNavLinks.forEach((link) => {
+      link.addEventListener("click", () => {
+        const target = el(link.dataset.scrollTarget);
+        if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        dom.viewNavLinks.forEach((item) => item.classList.toggle("active", item === link));
+      });
+    });
+  }
+
   function bindEvents() {
     // The security-master panel is a separate cache-only module.  Reuse the
     // dashboard's existing selection path so a catalogue click updates the
@@ -2569,6 +2730,9 @@ function quantMonitorFreshnessSummary(states) {
       if (symbol) selectSymbol(symbol).catch(() => {});
     });
     dom.refresh.addEventListener("click", () => refreshAll({ notify: true }));
+    dom.themeToggle?.addEventListener("click", toggleTheme);
+    dom.densityToggle?.addEventListener("click", toggleDensity);
+    bindWorkspaceNavigation();
     dom.collectNow?.addEventListener("click", collectLatest);
     dom.researchCompare?.addEventListener("click", compareSelectedResearchRuns);
     el("open-settings").addEventListener("click", () => {
@@ -2601,6 +2765,13 @@ function quantMonitorFreshnessSummary(states) {
         renderWatchlist();
       });
     }
+    dom.bankFilter?.querySelectorAll("[data-filter]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.bankFilter = button.dataset.filter || "all";
+        dom.bankFilter.querySelectorAll("[data-filter]").forEach((item) => item.classList.toggle("active", item === button));
+        renderWatchlist();
+      });
+    });
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) {
         updateClock();
@@ -2623,6 +2794,7 @@ function quantMonitorFreshnessSummary(states) {
   }
 
   function init() {
+    applyPreferences();
     bindEvents();
     updateClock();
     window.setInterval(updateClock, 1000);

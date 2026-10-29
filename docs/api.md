@@ -720,6 +720,25 @@ naive datetime 会被拒绝，避免跨时区日期改变成本归属。
 
 `indices` 的名称保留是为了当前看板兼容；实际内容是自选列表中的股票，不是真实指数或市场宽度。`alerts` / `signals` 计数目前最多统计最近 100 条，因此不是数据库总数。
 
+### `GET /api/v1/dashboard/daily`
+
+返回一个确定性的“每日决策看板”聚合结果。它只读取当前 provider 已落盘的最新报价、SQLite
+中的最近信号/告警和运行时就绪状态，不刷新行情、不调用 LLM、不发送通知，也不创建订单。该接口
+借鉴参考仓库的决策仪表盘形态，同时保留本项目的研究信号边界。
+
+`format` 可选 `json`（默认）或 `markdown`；`limit` 可选 1–200，限制标的、信号和告警明细。兼容
+别名为 `GET /api/v1/decision-digest`。JSON 顶层字段包括：
+
+- `generated_at` / `as_of` / `provider` / `market_status`：生成时间、参与快照的最新报价时间和市场语义；空缓存时 `as_of=null`。
+- `summary`：覆盖数、缺失数、涨跌家数、信号动作分布和告警分布。缺失涨跌幅计入 `unknown_change`，不会当作平盘。
+- `items` / `rankings`：每只证券的价格、涨跌幅、报价时间、新鲜度和最近研究信号；价格、涨跌幅或信号缺失时保留 `null` 或 `unavailable`。
+- `data_quality`：报价新鲜度计数、缺失证券和运行时数据就绪状态；`freshness` 可为 `fresh`、`stale`、`future_timestamp`、`unknown` 或 `untracked`。
+- `research_assurance`：历史补数就绪状态和原因，并固定包含 `research_only=true`、`orders_supported=false`、`decision_ready=false`；摘要聚合不会自行授予决策级认证。
+- `warnings` / `notice`：数据不完整、过期、未确认告警和无信号等明确限制。
+
+Markdown 响应适合离线归档或人工查看，但不提供通知发送能力。该日报仍是缓存快照和研究信号的
+展示，不构成投资建议或交易指令。
+
 ## 4. 行情与 K 线
 
 ### `GET /api/v1/sectors/banks`

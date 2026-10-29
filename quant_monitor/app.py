@@ -104,6 +104,8 @@ from quant_monitor.services import (
     MarketDataCollectionService,
     QuantitativeAnalysisService,
     QuoteCollectionResult,
+    build_decision_digest,
+    render_decision_digest_markdown,
 )
 from quant_monitor.services.analysis_inputs import (
     ANALYSIS_OBSERVATION_SCAN_LIMIT,
@@ -3951,6 +3953,78 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "data_notice": runtime().data_notice(),
             "notice": runtime().data_notice(),
         }
+
+    @app.get("/api/v1/dashboard/daily")
+    @app.get("/api/v1/decision-digest", include_in_schema=False)
+    async def daily_decision_dashboard(
+        response_format: str = Query(
+            default="json",
+            alias="format",
+            description="json or markdown; both formats are built from SQLite/cache only",
+        ),
+        limit: int = Query(default=50, ge=1, le=200),
+    ):
+        """Return a deterministic, cache-only daily research dashboard.
+
+        This is the local equivalent of a daily decision dashboard: it joins
+        the latest persisted quotes, signals, alerts and readiness metadata in
+        one bounded payload.  The route deliberately never refreshes a
+        provider, calls an LLM, sends a notification, or creates an order.
+        """
+
+        selected_format = str(response_format or "json").strip().lower()
+        if selected_format not in {"json", "markdown", "md"}:
+            raise HTTPException(status_code=422, detail="format must be json or markdown")
+        active_runtime = runtime()
+
+        def load_dashboard():
+            repository = active_runtime.repository
+            quotes = current_provider_items(
+                repository.get_latest_quotes(
+                    active_runtime.symbols,
+                    source_prefix=active_runtime.provider.name,
+                )
+            )
+            # Signals/alerts are already persisted and bounded at the
+            # repository boundary.  Read a slightly wider page than the
+            # rendered item count so the digest can still find the latest
+            # signal for every configured symbol.
+            history_limit = min(500, max(100, int(limit) * 5))
+            signals = repository.list_signals(limit=history_limit)
+            alerts = repository.list_alerts(limit=history_limit)
+            names = {
+                item.symbol: item.name
+                for item in repository.list_instruments(active_only=False)
+                if item.symbol in set(active_runtime.symbols)
+            }
+            status = active_runtime.system_status()
+            startup = status.get("startup") or {}
+            research_readiness = {
+                "ready": bool(startup.get("research_ready")),
+                "reason": startup.get("research_ready_reason") or "unknown",
+                "history_bootstrap": startup.get("history_bootstrap") or {},
+            }
+            return build_decision_digest(
+                quotes,
+                signals,
+                alerts,
+                configured_symbols=active_runtime.symbols,
+                instrument_names=names,
+                provider=active_runtime.provider.name,
+                market_status=status.get("market") or current_market_status(),
+                data_readiness=status.get("data_readiness") or {},
+                research_readiness=research_readiness,
+                stale_after_seconds=active_runtime.quote_stale_after_seconds,
+                limit=limit,
+            )
+
+        payload = await asyncio.to_thread(load_dashboard)
+        if selected_format in {"markdown", "md"}:
+            return PlainTextResponse(
+                render_decision_digest_markdown(payload),
+                media_type="text/markdown; charset=utf-8",
+            )
+        return jsonable(payload)
 
     @app.get("/api/v1/watchlist")
     async def watchlist():

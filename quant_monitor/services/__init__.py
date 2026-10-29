@@ -17,6 +17,7 @@ from .data_quality import (
 )
 from .indicators import IndicatorCalculator
 from .monitoring import CollectionJobSnapshot, MonitoringCycleResult, MonitoringService
+from .decision_digest import build_decision_digest, render_decision_digest_markdown
 
 __all__ = [
     "CollectionResult",
@@ -37,4 +38,6 @@ __all__ = [
     "QuantitativeAnalysisService",
     "Subscription",
     "SymbolDailyQuality",
+    "build_decision_digest",
+    "render_decision_digest_markdown",
 ]
